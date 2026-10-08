@@ -7,7 +7,7 @@ NexusPro AI is a production-grade, full-stack application designed to transform 
 ### 1. The NexusPro Optimization Pipeline (`/api/optimize-pipeline`)
 Unlike simple prompt-based wrappers, NexusPro uses a multi-stage server-side pipeline:
 - **Requirement Deconstruction**: Analyzes JDs to extract explicit and implicit technical/leadership requirements.
-- **Agentic Role Synthesis**: Spawns concurrent LLM tasks for each professional role to generate STAR-method achievements tailored specifically to the target job description.
+- **Agentic Role Synthesis**: Spawns concurrent LLM tasks, one per professional role, that rewrite each role's bullets in Google's XYZ format ("Accomplished X as measured by Y, by doing Z"). These per-role tasks receive the target role and company but not the job description; the Hybrid OpenAI and single-engine paths tailor against the full JD instead.
 - **Deduplication**: Removes duplicate bullets within each role before the resume is assembled.
 - **Match Score (computed, not AI-guessed)**: `src/lib/matchScore.ts` scores the resume against the job description in code - weighted JD keyword coverage (70%; "required" items and repeated terms weigh more, "preferred" items and soft skills less), job title (10%), years of experience from role dates (10%) and minimum degree (10%). Components the JD doesn't mention are dropped and the rest re-weighted. The same resume and JD always produce the same score; "Old" scores the submitted resume and "New" the rewrite. Hover a score to see its breakdown.
 - **Logic**: Implemented in Node.js using `server/optimization.ts` and `server/roleGenerator.ts`.
