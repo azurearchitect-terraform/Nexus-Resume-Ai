@@ -1,3 +1,5 @@
+import type { MatchScoreResult } from './lib/matchScore';
+
 export interface MasterResume {
   id: string;
   name: string;
@@ -93,7 +95,9 @@ export interface ResumeTemplate {
 
 export interface SuitabilityResult {
   verdict: "Strong Match" | "Stretch Role" | "Not Recommended";
+  /** Computed from the resume and JD by computeMatchScore when a JD is available. */
   matchScore: number;
+  matchAnalysis?: MatchScoreResult;
   dealbreakers: string[];
   strengths: string[];
   reasoning: string;

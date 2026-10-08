@@ -1049,7 +1049,6 @@ async function startServer() {
             "ats_keywords_from_jd": [...],
             "ats_keywords_added_to_resume": [...],
             "keyword_gap": [...],
-            "match_score": 85,
             "improvement_notes": [...],
             "audience_alignment_notes": "...",
             "star_stories": [...],

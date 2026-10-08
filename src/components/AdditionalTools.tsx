@@ -662,15 +662,17 @@ export const AdditionalTools: React.FC<AdditionalToolsProps> = ({
       
       {activeTab === 'skillGap' && (
         <div className="space-y-4">
-          {activeAudience && currentResults && currentResults[activeAudience] && (
+          {activeAudience && currentResults && typeof currentResults[activeAudience]?.match_score === 'number' && (
             <div className="flex gap-4 mb-4">
-              <div className="flex-1 p-3 rounded-lg bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 text-center">
-                <div className="text-[10px] uppercase tracking-wider opacity-60 mb-1">Old Score</div>
-                <div className="text-2xl font-black text-gray-400">{currentResults[activeAudience].baseline_score || 0}%</div>
-              </div>
+              {typeof currentResults[activeAudience].baseline_score === 'number' && (
+                <div className="flex-1 p-3 rounded-lg bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 text-center">
+                  <div className="text-[10px] uppercase tracking-wider opacity-60 mb-1">Old Score</div>
+                  <div className="text-2xl font-black text-gray-400">{currentResults[activeAudience].baseline_score}%</div>
+                </div>
+              )}
               <div className="flex-1 p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-center">
                 <div className="text-[10px] uppercase tracking-wider text-emerald-600 dark:text-emerald-400 mb-1">New Score</div>
-                <div className="text-2xl font-black text-emerald-500">{currentResults[activeAudience].match_score || 0}%</div>
+                <div className="text-2xl font-black text-emerald-500">{currentResults[activeAudience].match_score}%</div>
               </div>
             </div>
           )}

@@ -92,8 +92,6 @@ const OUTPUT_SCHEMA = `{
   "ats_keywords_from_jd": ["string"],
   "ats_keywords_added_to_resume": ["string"],
   "keyword_gap": ["string"],
-  "match_score": 85,
-  "baseline_score": 60,
   "improvement_notes": ["string"],
   "audience_alignment_notes": "string",
   "rejection_reasons": ["string"],

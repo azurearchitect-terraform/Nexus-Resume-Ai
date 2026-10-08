@@ -103,6 +103,7 @@ import CorporateProgressLoader from './components/CorporateProgressLoader';
 import { AuthModal } from './components/AuthModal';
 import { TermsModal } from './components/TermsModal';
 import { formatCertification } from './lib/certifications';
+import { describeMatchScore } from './lib/matchScore';
 
 import defaultMasterResume from './services/master_resume.json';
 
@@ -2112,7 +2113,7 @@ export default function App() {
       await Promise.all(masterResumes.map(async (resume) => {
         try {
           const resText = JSON.stringify(resume.data, null, 2);
-          const evaluation = await evaluateSuitability(resText, jobDesc, config, true);
+          const evaluation = await evaluateSuitability(resText, jobDesc, config, true, { targetRole, companyName });
           if (!isSuitabilityCancelledRef.current) {
             results[resume.id] = evaluation;
           }
@@ -2368,7 +2369,8 @@ export default function App() {
           customPrompt,
           selectedEngine.includes('hybrid') ? selectedEngine : undefined,
           targetCompany,
-          brainDump
+          brainDump,
+          companyName
         );
         
         completedAudiences++;
@@ -2440,7 +2442,9 @@ export default function App() {
       });
 
       const optimizationResults = await Promise.all(optimizationPromises);
-      const matchScore = optimizationResults[0]?.match_score || 0;
+      // Unset when there was no JD text to score against; Firestore rejects undefined fields.
+      const matchScore = optimizationResults[0]?.match_score;
+      const scoreField = typeof matchScore === 'number' ? { score: matchScore } : {};
       
       // Save version immediately after optimization
       saveResumeVersion(`Optimized - ${companyName} - ${new Date().toLocaleString()}`);
@@ -2456,7 +2460,7 @@ export default function App() {
             status: 'Saved',
             dateAdded: Date.now(),
             jd: jobDescription || jobUrl || '',
-            score: matchScore,
+            ...scoreField,
             updatedAt: serverTimestamp()
           });
           setLastJobId(docRef.id);
@@ -2478,7 +2482,7 @@ export default function App() {
             status: 'Saved',
             dateAdded: Date.now(),
             jd: jobDescription || jobUrl || '',
-            score: matchScore
+            ...scoreField
           };
           localStorage.setItem('ai_job_tracker', JSON.stringify([newJob, ...jobs]));
           setLastJobId(newId);
@@ -3688,11 +3692,21 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                           {/* Analysis Content */}
                           <div className="space-y-4">
                             <h3 className="text-xs font-bold uppercase tracking-widest text-white/80">2. Job Analysis</h3>
-                            {activeAudience && results[activeAudience] && results[activeAudience].match_score !== undefined && (
-                              <div className={`p-4 rounded-xl border flex items-center justify-between ${isDarkMode ? 'glass-panel border-white/10' : 'glass-panel-light border-black/5'}`}>
+                            {activeAudience && results[activeAudience] && results[activeAudience].match_score !== undefined && (() => {
+                              const analysis = results[activeAudience].match_analysis;
+                              return (
+                              <div
+                                className={`p-4 rounded-xl border ${isDarkMode ? 'glass-panel border-white/10' : 'glass-panel-light border-black/5'}`}
+                                title={analysis ? describeMatchScore(analysis.optimized) : undefined}
+                              >
+                                <div className="flex items-center justify-between">
                                 <div>
                                   <h3 className={`text-xs font-bold uppercase tracking-widest ${isDarkMode ? 'text-emerald-400' : 'text-emerald-700'}`}>Match Score</h3>
-                                  <p className={`text-[10px] mt-1 ${isDarkMode ? 'text-emerald-400/70' : 'text-emerald-600/70'}`}>Based on current JD</p>
+                                  <p className={`text-[10px] mt-1 ${isDarkMode ? 'text-emerald-400/70' : 'text-emerald-600/70'}`}>
+                                    {analysis
+                                      ? `${analysis.optimized.matchedKeywords.length}/${analysis.optimized.totalKeywords} JD keywords matched (was ${analysis.baseline.matchedKeywords.length})`
+                                      : 'Based on current JD'}
+                                  </p>
                                 </div>
                                 <div className="flex items-center gap-3">
                                   {results[activeAudience].baseline_score !== undefined && (
@@ -3706,8 +3720,22 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                                     <span className={`font-bold text-2xl text-emerald-500`}>{results[activeAudience].match_score}%</span>
                                   </div>
                                 </div>
+                                </div>
+                                {analysis && analysis.optimized.missingKeywords.length > 0 && (
+                                  <div className={`mt-3 pt-3 border-t ${isDarkMode ? 'border-white/10' : 'border-black/5'}`}>
+                                    <span className="text-[9px] font-bold uppercase tracking-widest opacity-60">Still missing from resume</span>
+                                    <div className="flex flex-wrap gap-1 mt-1.5">
+                                      {analysis.optimized.missingKeywords.slice(0, 8).map((kw, i) => (
+                                        <span key={`${kw}-${i}`} className="text-[9px] px-2 py-0.5 rounded-full border font-bold bg-red-500/10 border-red-500/20 text-red-400">
+                                          {kw}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
                               </div>
-                            )}
+                              );
+                            })()}
                             <div className="relative" ref={audienceDropdownRef}>
                               <div className="flex items-center justify-between mb-2">
                                 <label className={`text-[10px] font-bold uppercase tracking-widest ${isDarkMode ? 'text-white/70' : 'text-slate-800'}`}>Target Audiences (Multi-select)</label>
@@ -4176,7 +4204,7 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                                       suitabilityResult.matchScore >= 80 ? 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400' :
                                       suitabilityResult.matchScore >= 60 ? 'bg-amber-500/20 text-amber-600 dark:text-amber-400' :
                                       'bg-red-500/20 text-red-600 dark:text-red-400'
-                                    }`}>
+                                    }`} title={suitabilityResult.matchAnalysis ? describeMatchScore(suitabilityResult.matchAnalysis) : undefined}>
                                       {suitabilityResult.matchScore}% Match
                                     </div>
                                     {suitabilityResult.matchScore >= 85 && (
@@ -4481,13 +4509,25 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                                   </div>
                                 )}
 
-                                {results[activeAudience]._intermediateData?.jdKeywords && (
+                                {(() => {
+                                  // Prefer the computed analysis of the optimized resume; older saved
+                                  // results only carry the extracted JD keywords.
+                                  const analysis = results[activeAudience].match_analysis;
+                                  const registry = analysis
+                                    ? [
+                                        ...analysis.optimized.matchedKeywords.map((kw) => ({ kw, isFound: true })),
+                                        ...analysis.optimized.missingKeywords.map((kw) => ({ kw, isFound: false })),
+                                      ]
+                                    : (results[activeAudience]._intermediateData?.jdKeywords || []).slice(0, 15).map((kw: string) => ({
+                                        kw,
+                                        isFound: resumeText.toLowerCase().includes(kw.toLowerCase()),
+                                      }));
+                                  if (registry.length === 0) return null;
+                                  return (
                                   <div className="space-y-3 mt-4 pt-4 border-t border-black/10 dark:border-white/10">
                                     <h4 className="font-bold text-[10px] uppercase tracking-widest opacity-60">Target Keyword Registry</h4>
                                     <div className="flex flex-wrap gap-1.5">
-                                      {results[activeAudience]._intermediateData.jdKeywords.slice(0, 15).map((kw: string, i: number) => {
-                                        const isFound = resumeText.toLowerCase().includes(kw.toLowerCase());
-                                        return (
+                                      {registry.map(({ kw, isFound }, i) => (
                                           <span 
                                             key={i} 
                                             className={`text-[9px] px-2 py-0.5 rounded-full border font-bold transition-all ${
@@ -4498,11 +4538,11 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                                           >
                                             {kw}
                                           </span>
-                                        );
-                                      })}
+                                      ))}
                                     </div>
                                   </div>
-                                )}
+                                  );
+                                })()}
                               </div>
                             </div>
                           )}

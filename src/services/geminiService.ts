@@ -7,6 +7,7 @@ import { doc, getDoc, getDocFromServer } from "firebase/firestore";
 import { db, auth } from "../firebase";
 import { categorizeSkills } from "../lib/skillCategorizer";
 import { buildResumeGenerationPrompt } from "../lib/resumePrompt";
+import { computeMatchScore, MatchScoreOptions, MatchScoreResult } from "../lib/matchScore";
 
 export interface OptimizationResult {
   personal_info: {
@@ -36,8 +37,14 @@ export interface OptimizationResult {
   ats_keywords_from_jd: string[];
   ats_keywords_added_to_resume: string[];
   keyword_gap: string[];
-  match_score: number;
-  baseline_score: number;
+  /** Computed by computeMatchScore from the rewritten resume - never taken from the model. */
+  match_score?: number;
+  /** Computed by computeMatchScore from the resume that was submitted for optimization. */
+  baseline_score?: number;
+  match_analysis?: {
+    baseline: MatchScoreResult;
+    optimized: MatchScoreResult;
+  };
   improvement_notes: string[];
   audience_alignment_notes: string;
   why_this_job?: string;
@@ -355,7 +362,8 @@ export async function evaluateSuitability(
   resumeText: string,
   jobDescription: string,
   config: RouterConfig,
-  fastMode: boolean = false
+  fastMode: boolean = false,
+  scoreOptions: MatchScoreOptions = {}
 ): Promise<SuitabilityResult> {
   const routedConfig = routeTask('evaluate_suitability', config);
   
@@ -408,7 +416,19 @@ Return ONLY a JSON object with the following structure:
     const data = await callAI(prompt, modelToUse, routedConfig.engine, routedConfig.apiKey);
     const resultText = extractJson(data.result || "");
     if (!resultText) throw new Error("No response from AI");
-    return JSON.parse(resultText);
+    const parsed = JSON.parse(resultText);
+    // The verdict and critique stay AI-written; the percentage is computed from the
+    // documents so it is reproducible and comparable across resumes.
+    try {
+      const computed = computeMatchScore(resumeText, jobDescription, scoreOptions);
+      if (computed) {
+        parsed.matchScore = computed.score;
+        parsed.matchAnalysis = computed;
+      }
+    } catch (scoreError) {
+      console.warn("[MatchScore] Could not compute suitability score:", scoreError);
+    }
+    return parsed;
   } catch (error) {
     console.error("Error evaluating suitability:", error);
     throw error;
@@ -510,6 +530,37 @@ function reconcileExperience(resumeText: string, aiExperience: any): any[] {
   return output;
 }
 
+/**
+ * Replaces any model-written scores with scores computed from the documents.
+ * baseline_score rates the resume as submitted; match_score rates the rewrite.
+ * Both are left unset when there is no job description text to score against,
+ * rather than showing a number that measures nothing.
+ */
+function applyComputedMatchScores(
+  result: any,
+  sourceResume: string,
+  jobDescription: string,
+  options: MatchScoreOptions
+): any {
+  delete result.match_score;
+  delete result.baseline_score;
+  delete result.match_analysis;
+
+  try {
+    const baseline = computeMatchScore(sourceResume, jobDescription, options);
+    const optimized = computeMatchScore(result, jobDescription, options);
+    if (baseline && optimized) {
+      result.baseline_score = baseline.score;
+      result.match_score = optimized.score;
+      result.match_analysis = { baseline, optimized };
+    }
+  } catch (error) {
+    // A scoring fault must not discard (or re-bill) a finished rewrite.
+    console.warn("[MatchScore] Could not compute match score:", error);
+  }
+  return result;
+}
+
 export async function optimizeResume(
   resumeText: string,
   jobDescription: string,
@@ -525,9 +576,11 @@ export async function optimizeResume(
   customPrompt?: string,
   pipelineType?: string,
   targetCompany?: string,
-  brainDump?: string
+  brainDump?: string,
+  companyName?: string
 ): Promise<OptimizationResult> {
   const routedConfig = routeTask(recruiterSimulationMode ? 'recruiter_simulation' : 'rewrite_resume', config);
+  const scoreOptions: MatchScoreOptions = { targetRole, companyName };
   
   // Cost-saving logic: If fastMode is enabled, prefer Gemini Flash even in Hybrid mode to reduce OpenAI costs
   let modelToUse = routedConfig.model;
@@ -634,7 +687,7 @@ export async function optimizeResume(
           return obj;
         };
 
-        return fixTitle(parsed);
+        return applyComputedMatchScores(fixTitle(parsed), resumeText, jobDescription, scoreOptions);
       }
     } catch (e) {
       console.warn("V2 Pipeline failed, falling back to legacy optimization:", e);
@@ -672,14 +725,6 @@ export async function optimizeResume(
 
       try {
         const parsed = JSON.parse(resultText);
-        
-        // Ensure scores are present and numeric
-        if (typeof parsed.match_score !== 'number') {
-          parsed.match_score = parseInt(parsed.match_score) || 70;
-        }
-        if (typeof parsed.baseline_score !== 'number') {
-          parsed.baseline_score = parseInt(parsed.baseline_score) || 50;
-        }
 
         // Skills must be grouped into categories.
         let parsedSkills = parsed.skills || {};
@@ -736,7 +781,7 @@ export async function optimizeResume(
           return obj;
         };
 
-        return fixTitle(parsed);
+        return applyComputedMatchScores(fixTitle(parsed), resumeText, jobDescription, scoreOptions);
       } catch (e) {
         console.error(`Error parsing ${engineToUse} response:`, e, "Raw text:", resultText);
         throw new Error(`JSON_PARSING_ERROR: The ${engineToUse} engine returned an invalid response format.`);
