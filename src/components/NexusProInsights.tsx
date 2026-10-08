@@ -162,7 +162,14 @@ export const NexusProInsights: React.FC<NexusProInsightsProps> = ({ isDarkMode, 
               {!starStories?.length ? (
                 <div className="p-12 text-center opacity-30 text-xs italic">No STAR stories generated for this audience.</div>
               ) : (
-                starStories.map((star, idx) => (
+                starStories.map((star, idx) => {
+                  const followUps = (Array.isArray(star.follow_ups) ? star.follow_ups : []).filter(
+                    (q): q is string => typeof q === 'string' && q.trim().length > 0
+                  );
+                  const prepGaps = (Array.isArray(star.prep_gaps) ? star.prep_gaps : []).filter(
+                    (g): g is string => typeof g === 'string' && g.trim().length > 0
+                  );
+                  return (
                   <div 
                     key={idx}
                     className={`rounded-2xl border transition-all ${
@@ -179,7 +186,22 @@ export const NexusProInsights: React.FC<NexusProInsightsProps> = ({ isDarkMode, 
                         <Target className="w-3.5 h-3.5 text-purple-500" />
                       </div>
                       <div className="flex-1 min-w-0 pr-4">
+                        {star.competency && (
+                          <span className={`inline-block mb-1.5 px-2 py-0.5 rounded-full text-[8px] font-black uppercase tracking-widest ${
+                            isDarkMode ? 'bg-purple-500/15 text-purple-300' : 'bg-purple-100 text-purple-700'
+                          }`}>
+                            {star.competency}
+                          </span>
+                        )}
+                        {star.question && (
+                          <p className="text-[10px] italic opacity-70 leading-relaxed mb-1">"{star.question}"</p>
+                        )}
                         <p className="text-[11px] font-bold leading-relaxed">{star.bullet}</p>
+                        {(star.role || star.company) && (
+                          <p className="text-[9px] uppercase tracking-widest opacity-50 mt-1">
+                            {[star.role, star.company].filter(Boolean).join(' · ')}
+                          </p>
+                        )}
                       </div>
                       <ChevronDown className={`w-4 h-4 transition-transform shrink-0 ${expandedStar === idx ? 'rotate-180' : ''}`} />
                     </button>
@@ -211,12 +233,40 @@ export const NexusProInsights: React.FC<NexusProInsightsProps> = ({ isDarkMode, 
                               <div className="text-[9px] font-bold text-emerald-600 dark:text-emerald-400 uppercase tracking-widest mb-1">Result</div>
                               <p className="text-[10px] font-medium leading-relaxed">{star.result}</p>
                             </div>
+                            {star.learning && (
+                              <div className={`p-3 rounded-xl ${isDarkMode ? 'bg-black/40' : 'bg-white shadow-sm'}`}>
+                                <div className="text-[9px] font-bold text-amber-500 uppercase tracking-widest mb-1">Learning</div>
+                                <p className="text-[10px] opacity-70 leading-relaxed">{star.learning}</p>
+                              </div>
+                            )}
+                            {followUps.length > 0 && (
+                              <div className={`p-3 rounded-xl ${isDarkMode ? 'bg-black/40' : 'bg-white shadow-sm'}`}>
+                                <div className="text-[9px] font-bold text-blue-500 uppercase tracking-widest mb-1">Likely follow-up questions</div>
+                                <ul className="space-y-1">
+                                  {followUps.map((q, qIdx) => (
+                                    <li key={qIdx} className="text-[10px] opacity-70 leading-relaxed">• {q}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                            {prepGaps.length > 0 && (
+                              <div className={`p-3 rounded-xl border ${isDarkMode ? 'border-amber-500/30 bg-amber-500/5' : 'border-amber-200 bg-amber-50'}`}>
+                                <div className="text-[9px] font-bold text-amber-600 dark:text-amber-400 uppercase tracking-widest mb-1">Prepare before the interview</div>
+                                <p className="text-[9px] opacity-60 mb-1">Your resume does not state these - have real answers ready.</p>
+                                <ul className="space-y-1">
+                                  {prepGaps.map((gap, gIdx) => (
+                                    <li key={gIdx} className="text-[10px] opacity-80 leading-relaxed">• {gap}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
                           </div>
                         </motion.div>
                       )}
                     </AnimatePresence>
                   </div>
-                ))
+                  );
+                })
               )}
             </motion.div>
           )}

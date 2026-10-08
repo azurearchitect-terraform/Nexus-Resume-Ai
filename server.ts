@@ -18,7 +18,7 @@ import { renderResumeToHTML } from "./server/resumeTemplate.ts";
 import { pipelineCache } from "./server/cacheUtility";
 import { calculateCost, UsageLog } from "./server/analytics";
 import { runAgents } from "./server/agents";
-import { generatePerRole } from "./server/roleGenerator";
+import { generatePerRole, selectStarStories } from "./server/roleGenerator";
 import { deduplicateAndScore } from "./server/dedup";
 import { saveResumeVersion } from "./server/memory";
 import { buildResumeGenerationPrompt } from "./src/lib/resumePrompt";
@@ -1051,7 +1051,6 @@ async function startServer() {
             "keyword_gap": [...],
             "improvement_notes": [...],
             "audience_alignment_notes": "...",
-            "star_stories": [...],
             "audit_report": { ... }
           }
         `;
@@ -1075,7 +1074,12 @@ async function startServer() {
             audience,
             mode,
             customPrompt,
-            brainDump
+            brainDump,
+            {
+              // Each role is tailored against the real posting, like the whole-document path.
+              jobDescription: Optimization.trimInput(jobDescription, 6000),
+              jdKeywords: optimizedInput.jd_keywords,
+            }
           )
         ]);
 
@@ -1087,11 +1091,16 @@ async function startServer() {
         
         // 3. Deduplicate and Score
         console.log("[Pipeline] Deduplicating and Scoring...");
-        const finalExperience = deduplicateAndScore(roleResults);
+        const finalExperience = deduplicateAndScore(
+          roleResults.map(({ star_stories, generation, ...role }) => role)
+        );
 
         const finalResult = {
           ...metaData,
-          experience: finalExperience
+          experience: finalExperience,
+          // Drafted per role, next to the evidence and the bullets they expand. The meta
+          // call never sees the bullets, so stories it wrote could not link to any.
+          star_stories: selectStarStories(roleResults)
         };
 
         // STEP 4: Agentic Review (Multi-Agent Refinement)
