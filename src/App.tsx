@@ -104,7 +104,6 @@ import { AuthModal } from './components/AuthModal';
 import { TermsModal } from './components/TermsModal';
 import { formatCertification } from './lib/certifications';
 import { describeMatchScore } from './lib/matchScore';
-import { describeImpactScore } from './lib/impactScore';
 
 import defaultMasterResume from './services/master_resume.json';
 
@@ -3737,69 +3736,6 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                               </div>
                               );
                             })()}
-                            {activeAudience && results[activeAudience]?.impact_audit && (() => {
-                              const audit = results[activeAudience].impact_audit!;
-                              const tone = audit.score >= 75 ? 'text-emerald-500' : audit.score >= 55 ? 'text-amber-500' : 'text-red-500';
-                              const stories = results[activeAudience].star_stories?.length ?? 0;
-                              const unverified = audit.unverified_figure_bullets ?? 0;
-                              return (
-                              <div
-                                className={`p-4 rounded-xl border ${isDarkMode ? 'glass-panel border-white/10' : 'glass-panel-light border-black/5'}`}
-                                title={describeImpactScore(audit)}
-                              >
-                                <div className="flex items-center justify-between">
-                                  <div>
-                                    <h3 className={`text-xs font-bold uppercase tracking-widest ${isDarkMode ? 'text-sky-400' : 'text-sky-700'}`}>FAANG / STAR Impact</h3>
-                                    <p className="text-[10px] mt-1 opacity-70">
-                                      {audit.bullets_evaluated} bullets · {Math.round(audit.quantified_ratio * 100)}% quantified · {stories} STAR {stories === 1 ? 'story' : 'stories'}
-                                      {unverified > 0 && <span className="text-red-400"> · {unverified} unverified figure{unverified === 1 ? '' : 's'}</span>}
-                                    </p>
-                                  </div>
-                                  <div className="flex items-center gap-3">
-                                    {typeof audit.baseline_score === 'number' && (
-                                      <div className="text-right">
-                                        <span className="text-[10px] uppercase tracking-widest opacity-60 block">Old</span>
-                                        <span className="font-bold text-lg opacity-60 line-through">{audit.baseline_score}</span>
-                                      </div>
-                                    )}
-                                    <div className="text-right">
-                                      <span className={`text-[10px] uppercase tracking-widest block ${tone}`}>New</span>
-                                      <span className={`font-bold text-2xl ${tone}`}>{audit.score}</span>
-                                    </div>
-                                  </div>
-                                </div>
-                                <details className={`mt-3 pt-3 border-t ${isDarkMode ? 'border-white/10' : 'border-black/5'}`}>
-                                  <summary className="text-[9px] font-bold uppercase tracking-widest opacity-60 cursor-pointer select-none">
-                                    Breakdown{audit.findings.length > 0 ? ` & top fixes (${audit.findings.length})` : ''}
-                                  </summary>
-                                  <div className="mt-2 space-y-1">
-                                    {audit.components.map((component) => (
-                                      <div key={component.id} className="flex items-center justify-between gap-3 text-[10px]" title={component.detail}>
-                                        <span className="opacity-70 truncate">{component.label}</span>
-                                        <span className="font-bold tabular-nums whitespace-nowrap">{Math.round(component.score * 100)}%</span>
-                                      </div>
-                                    ))}
-                                  </div>
-                                  {audit.findings.length > 0 && (
-                                    <div className="mt-2 space-y-1.5">
-                                      {audit.findings.slice(0, 4).map((finding, idx) => (
-                                        <div key={`${finding.id}-${idx}`} className="text-[10px] leading-relaxed">
-                                          <span className={`font-bold uppercase tracking-wider mr-1 ${
-                                            finding.severity === 'high' ? 'text-red-500' : finding.severity === 'medium' ? 'text-amber-500' : 'opacity-50'
-                                          }`}>{finding.severity}</span>
-                                          <span className="opacity-80">{finding.issue}</span>
-                                          <span className="opacity-50"> → {finding.fix}</span>
-                                          {finding.bullet && (
-                                            <p className="opacity-40 italic truncate mt-0.5" title={finding.bullet}>“{finding.bullet}”</p>
-                                          )}
-                                        </div>
-                                      ))}
-                                    </div>
-                                  )}
-                                </details>
-                              </div>
-                              );
-                            })()}
                             <div className="relative" ref={audienceDropdownRef}>
                               <div className="flex items-center justify-between mb-2">
                                 <label className={`text-[10px] font-bold uppercase tracking-widest ${isDarkMode ? 'text-white/70' : 'text-slate-800'}`}>Target Audiences (Multi-select)</label>
@@ -4271,24 +4207,8 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                                     }`} title={suitabilityResult.matchAnalysis ? describeMatchScore(suitabilityResult.matchAnalysis) : undefined}>
                                       {suitabilityResult.matchScore}% Match
                                     </div>
-                                    {suitabilityResult.impactAudit && (
-                                      <div
-                                        className={`text-[10px] font-bold px-2 py-1 rounded-md ${
-                                          suitabilityResult.impactAudit.score >= 75 ? 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400' :
-                                          suitabilityResult.impactAudit.score >= 55 ? 'bg-amber-500/20 text-amber-600 dark:text-amber-400' :
-                                          'bg-red-500/20 text-red-600 dark:text-red-400'
-                                        }`}
-                                        title={`FAANG/STAR bullet impact of this resume as it stands\n${describeImpactScore(suitabilityResult.impactAudit)}`}
-                                      >
-                                        Impact {suitabilityResult.impactAudit.score}
-                                      </div>
-                                    )}
-                                    {/* Both halves are computed: the posting is matched, and the bullets meet the FAANG/STAR bar. */}
-                                    {suitabilityResult.matchScore >= 80 && (suitabilityResult.impactAudit?.score ?? 0) >= 75 && (
-                                      <div
-                                        className="bg-gradient-to-r from-blue-600 to-purple-600 text-white text-[9px] font-black px-2 py-1 rounded-md shadow-lg animate-pulse flex items-center gap-1"
-                                        title="JD match of 80% or more, and FAANG/STAR bullet impact of 75 or more"
-                                      >
+                                    {suitabilityResult.matchScore >= 85 && (
+                                      <div className="bg-gradient-to-r from-blue-600 to-purple-600 text-white text-[9px] font-black px-2 py-1 rounded-md shadow-lg animate-pulse flex items-center gap-1">
                                         <Zap className="w-2.5 h-2.5 fill-current" />
                                         FAANG READY
                                       </div>
@@ -4638,11 +4558,11 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                           <p className="text-[11px] opacity-60 leading-relaxed font-medium">
                             {(() => {
                               const tips = [
-                                "Use the Google XYZ formula: 'Accomplished [X] as measured by [Y], by doing [Z]' - and only claim a [Y] you can defend.",
-                                "FAANG recruiters spend ~6 seconds on the first pass. Open every bullet with the action and close on what changed.",
+                                "Use the Google XYZ formula: 'Accomplished [X] as measured by [Y], by doing [Z]'.",
+                                "FAANG recruiters spend ~6 seconds on the first pass. Keep bullets punchy and metric-heavy.",
                                 "Ensure your 'Skills' section matches the JD keywords in our Registry exactly for high ATS score.",
                                 "Leadership is not just for managers. Show how you mentored peers or led cross-functional efforts.",
-                                "Exact numbers beat round ones: add real figures (users served, latency before and after) to your master resume - the optimizer never invents them."
+                                "Cloud projects? Always include specific scale metrics (e.g., 'Serving 5M+ DAU' or 'Reduced latency by 40%')."
                               ];
                               return tips[Math.floor((Date.now() / 86400000) % tips.length)]; // Daily rotation
                             })()}

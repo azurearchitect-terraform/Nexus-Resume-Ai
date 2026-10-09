@@ -1,472 +1,119 @@
-/**
- * Per-role bullet generation for the default split-generation pipeline
- * (POST /api/v2/optimize, hybrid-gemini branch).
- *
- * Each role is rewritten by its own model call using the shared per-role prompt from
- * src/lib/resumePrompt.ts, so the FAANG and STAR standards are the same ones the
- * whole-document path uses, and every role is tailored against the real job
- * description. The output is then checked mechanically (lead verbs, ownership voice,
- * figure provenance, this pipeline's terminology ban, duplicates, bullet count), and a
- * role that fails gets one corrective retry that names the exact problems.
- *
- * Adapted from PR #3 (ba1c542) without its bullet-budget engine: the budget comes from
- * the "bullet_budget" field each structured role already carries.
- */
-
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
-import { buildRoleBulletPrompt, roleBudgetHint } from "../src/lib/resumePrompt";
-import type { RoleBudgetHint, RoleBulletPromptOptions } from "../src/lib/resumePrompt";
-import {
-  buildFigureIndex,
-  findUnsupportedFigures,
-  inspectBullet,
-  isWeVoice,
-  linkStarStories,
-} from "../src/lib/impactScore";
-import type { FigureIndex } from "../src/lib/impactScore";
-
-const PRIMARY_MODEL = "gemini-3.5-flash";
-const FALLBACK_MODEL = "gemini-3.1-flash-lite";
-/** Failed or unparseable calls tolerated per role before falling back to the source bullets. */
-const MAX_CALL_FAILURES = 3;
-/** Interview-prep stories kept for the whole document. */
-const MAX_STAR_STORIES = 6;
-
-/** This pipeline's long-standing terminology ban, verified rather than only requested. */
-const FORBIDDEN_TERMS: { pattern: RegExp; term: string }[] = [
-  { pattern: /\bci\s*\/\s*cd\b/i, term: "CI/CD" },
-  { pattern: /\bpipelines?\b/i, term: "Pipelines" },
-  { pattern: /\bdevops\b/i, term: "DevOps" },
-];
-
-const TERMINOLOGY_RULE = `TERMINOLOGY BAN: the terms "CI/CD", "Pipelines", and "DevOps" are FORBIDDEN. Use
-   "Infrastructure Automation", "Workflow Orchestration", or "Release Engineering" instead.`;
-
-export interface RoleOutput {
-  bullets: string[];
-  star_stories: any[];
-}
-
-export interface RoleValidation {
-  /** Problems worth a corrective retry. */
-  hard: string[];
-  /** Problems recorded for the logs and left to the impact audit. */
-  soft: string[];
-}
-
-export interface RoleGenerationResult {
-  id: string;
-  role: string;
-  company: string;
-  duration: string;
-  bullets: string[];
-  star_stories: any[];
-  generation: {
-    model_calls: number;
-    retried: boolean;
-    /** True when every call failed and the source bullets were used instead. */
-    fallback: boolean;
-    budget: string | null;
-    star_quota: number;
-    /** Problems remaining in the delivered attempt. */
-    issues: string[];
-  };
-}
-
-export interface GeneratePerRoleOptions {
-  /** The target posting, already trimmed by the caller. */
-  jobDescription?: string;
-  jdKeywords?: string[];
-}
-
-/** Sends one prompt to the model and returns its raw text. Injectable so tests need no API. */
-export type RoleModelCaller = (prompt: string) => Promise<string>;
-
-type SharedPromptOptions = Omit<
-  RoleBulletPromptOptions,
-  "role" | "sourceBullets" | "budget" | "starStoryCount" | "retryFeedback"
->;
-
-function toText(value: unknown): string {
-  if (typeof value === "string") return value.trim();
-  if (value && typeof value === "object") {
-    const v = value as { text?: unknown; bullet?: unknown };
-    if (typeof v.text === "string") return v.text.trim();
-    if (typeof v.bullet === "string") return v.bullet.trim();
-  }
-  return "";
-}
-
-function asText(value: unknown): string {
-  return typeof value === "string" ? value : value == null ? "" : String(value);
-}
-
-/** The role's own evidence, whichever field the upstream extraction used. */
-function sourceBulletsOf(role: any): string[] {
-  const list = [role?.original_bullets, role?.achievements, role?.bullets].find(
-    (candidate) => Array.isArray(candidate) && candidate.length > 0
-  );
-  return (Array.isArray(list) ? list : []).map(toText).filter(Boolean);
-}
-
-function normalizeKey(text: string): string {
-  return text.toLowerCase().replace(/[^a-z0-9]+/g, "");
-}
-
-function quoteList(items: string[]): string {
-  return items.map((item) => `"${item}"`).join(", ");
-}
-
-/**
- * STAR stories to draft from one role. Depth follows the bullet budget: recent,
- * long-tenure roles carry two, ordinary roles one, and brief or very old stints none.
- */
-export function starQuotaFor(budget: RoleBudgetHint, index: number): number {
-  if (budget.min === null || budget.max === null) return index === 0 ? 2 : 1;
-  if (budget.max <= 2) return 0;
-  // The planner only grants "4-5" or "6-7" to the current or most recent long role;
-  // earlier long roles get "3-4".
-  if (budget.min >= 4) return 2;
-  return 1;
-}
-
-/** Parses the model's reply: the {bullets, star_stories} object, or a bare bullet array. */
-export function parseRoleOutput(text: string): RoleOutput {
-  const cleaned = String(text || "")
-    .trim()
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/, "");
-  const parsed = JSON.parse(cleaned);
-  const rawBullets = Array.isArray(parsed) ? parsed : parsed?.bullets;
-  if (!Array.isArray(rawBullets)) throw new Error("response has no bullets array");
-  const stories =
-    !Array.isArray(parsed) && Array.isArray(parsed?.star_stories)
-      ? parsed.star_stories.filter((story: unknown) => story !== null && typeof story === "object")
-      : [];
-  return { bullets: rawBullets.map(toText).filter(Boolean), star_stories: stories };
-}
-
-/**
- * Mechanical checks on one role's output against the rules its prompt states. A count
- * below the budget is only raised when the source holds enough evidence to meet it:
- * asking for more bullets than the source supports would ask for fabrication.
- */
-export function validateRoleOutput(
-  output: RoleOutput,
-  budget: RoleBudgetHint,
-  context: { sourceCount: number; figureIndex: FigureIndex | null; storyFigureIndex?: FigureIndex | null }
-): RoleValidation {
-  const hard: string[] = [];
-  const soft: string[] = [];
-  const count = output.bullets.length;
-
-  if (budget.min !== null && budget.max !== null && context.sourceCount > 0) {
-    const floor = Math.min(budget.min, context.sourceCount);
-    if (count < floor) {
-      hard.push(
-        `Only ${count} bullet${count === 1 ? " was" : "s were"} written. This role's budget is ${budget.label} and ` +
-          `the source lists ${context.sourceCount} items of evidence: write at least ${floor} distinct ` +
-          `achievements drawn from it - never invent one.`
-      );
-    }
-    if (count > budget.max) {
-      hard.push(`${count} bullets exceed this role's budget of ${budget.label}: keep the ${budget.max} strongest.`);
-    }
-  }
-
-  const seen = new Map<string, number>();
-  output.bullets.forEach((bullet, i) => {
-    const n = i + 1;
-    const inspection = inspectBullet(bullet);
-    if (inspection.bannedLead) {
-      hard.push(`Bullet ${n} opens with the banned verb "${inspection.lead}".`);
-    } else if (!inspection.strongLead) {
-      soft.push(`Bullet ${n} does not open with a past-tense action verb ("${inspection.lead}").`);
-    }
-    if (inspection.passive) {
-      hard.push(`Bullet ${n} uses "${inspection.passive}" - state exactly what this person did.`);
-    } else if (inspection.firstPerson) {
-      hard.push(`Bullet ${n} uses "I" or "my" - write in implied first person, verb first.`);
-    }
-    const unsupported = context.figureIndex ? findUnsupportedFigures(bullet, context.figureIndex) : [];
-    if (unsupported.length > 0) {
-      hard.push(
-        `Bullet ${n} states ${quoteList(unsupported)}, which the source never states - use the ` +
-          `source's exact figure or remove it.`
-      );
-    }
-    const forbidden = FORBIDDEN_TERMS.find((entry) => entry.pattern.test(bullet));
-    if (forbidden) hard.push(`Bullet ${n} uses the forbidden term "${forbidden.term}".`);
-
-    const key = normalizeKey(bullet);
-    const first = seen.get(key);
-    if (first !== undefined) hard.push(`Bullet ${n} repeats bullet ${first}.`);
-    else seen.set(key, n);
-  });
-
-  output.star_stories.forEach((story, j) => {
-    const n = j + 1;
-    if (isWeVoice(asText(story?.action))) {
-      hard.push(`STAR story ${n}'s action is told as "we" - rewrite it in first person singular.`);
-    }
-    // The same fields the client audit traces. "learning" looks forward ("next time I'd
-    // pilot it for 2 weeks"), so its numbers are not claims about the past.
-    const narrative = ["situation", "task", "action", "result"]
-      .map((field) => asText(story?.[field]))
-      .join("\n");
-    const storyIndex = context.storyFigureIndex ?? context.figureIndex;
-    const unsupported = storyIndex ? findUnsupportedFigures(narrative, storyIndex) : [];
-    if (unsupported.length > 0) {
-      hard.push(
-        `STAR story ${n} states ${quoteList(unsupported)}, which the source never states - list the ` +
-          `missing detail in prep_gaps instead.`
-      );
-    }
-  });
-
-  return { hard, soft };
-}
-
-/** Keeps only the stories that quote one of this role's bullets, as the final audit will. */
-function linkRoleStories(output: RoleOutput, role: any): number {
-  const mini = {
-    experience: [{ role: asText(role?.role), company: asText(role?.company), bullets: output.bullets }],
-    star_stories: output.star_stories,
-  };
-  const { dropped } = linkStarStories(mini);
-  output.star_stories = mini.star_stories;
-  return dropped;
-}
-
-function geminiCaller(genAI: GoogleGenAI): RoleModelCaller {
-  return async (prompt: string) => {
-    const contents = [{ role: "user", parts: [{ text: prompt }] }];
-    try {
-      const res = await genAI.models.generateContent({
-        model: PRIMARY_MODEL,
-        contents,
-        config: {
-          responseMimeType: "application/json",
-          // Low thinking keeps per-role calls cheap; the validator and retry carry the quality bar.
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        },
-      });
-      return res.text || "";
-    } catch (e: any) {
-      console.warn(`[RoleGen] ${PRIMARY_MODEL} failed (${e?.message || e}), trying ${FALLBACK_MODEL}...`);
-      const res = await genAI.models.generateContent({
-        model: FALLBACK_MODEL,
-        contents,
-        config: { responseMimeType: "application/json" },
-      });
-      return res.text || "";
-    }
-  };
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/** Writes one role: generate, validate, retry once with the exact problems, keep the cleaner attempt. */
-export async function generateRole(
-  callModel: RoleModelCaller,
-  role: any,
-  index: number,
-  shared: SharedPromptOptions,
-  retryDelayMs = 1000
-): Promise<RoleGenerationResult> {
-  const id = typeof role?.id === "string" && role.id ? role.id : `role_${index + 1}`;
-  const identity = {
-    id,
-    role: asText(role?.role || role?.title),
-    company: asText(role?.company),
-    duration: asText(role?.duration),
-  };
-  const label = `${id} (${[identity.role, identity.company].filter(Boolean).join(" @ ") || "untitled"})`;
-  const budget = roleBudgetHint(role);
-  const starQuota = starQuotaFor(budget, index);
-  const sourceBullets = sourceBulletsOf(role);
-
-  let figureIndex: FigureIndex | null = null;
-  let storyFigureIndex: FigureIndex | null = null;
-  try {
-    const evidenceText = [sourceBullets.join("\n"), identity.role, identity.company, identity.duration, shared.brainDump, shared.customPrompt]
-      .filter(Boolean)
-      .join("\n");
-    figureIndex = buildFigureIndex(evidenceText);
-    // The prompt shows the tenure in months, so a story may repeat it.
-    storyFigureIndex = buildFigureIndex(
-      budget.tenureMonths !== null ? `${evidenceText}\n${budget.tenureMonths} months` : evidenceText,
-      { tenure: true }
-    );
-  } catch (e: any) {
-    // Provenance checks are skipped rather than failing the role.
-    console.warn(`[RoleGen] ${label}: figure provenance unavailable:`, e?.message || e);
-  }
-
-  let best: { output: RoleOutput; validation: RoleValidation } | null = null;
-  let retryFeedback: RoleBulletPromptOptions["retryFeedback"];
-  let modelCalls = 0;
-  let failures = 0;
-  let retried = false;
-
-  while (failures < MAX_CALL_FAILURES) {
-    const prompt = buildRoleBulletPrompt({
-      ...shared,
-      role: identity,
-      sourceBullets,
-      budget,
-      starStoryCount: starQuota,
-      retryFeedback,
-    });
-
-    let output: RoleOutput;
-    try {
-      modelCalls += 1;
-      output = parseRoleOutput(await callModel(prompt));
-    } catch (err: any) {
-      failures += 1;
-      console.warn(`[RoleGen] ${label}: call failed (${failures}/${MAX_CALL_FAILURES}):`, err?.message || err);
-      // A failed corrective retry keeps the attempt already in hand.
-      if (best) break;
-      if (failures < MAX_CALL_FAILURES) await sleep(retryDelayMs * failures);
-      continue;
-    }
-
-    const droppedStories = linkRoleStories(output, identity);
-    const validation = validateRoleOutput(output, budget, {
-      sourceCount: sourceBullets.length,
-      figureIndex,
-      storyFigureIndex,
-    });
-    if (droppedStories > 0) {
-      validation.soft.push(
-        `${droppedStories} STAR ${droppedStories === 1 ? "story" : "stories"} did not quote a bullet verbatim and ${
-          droppedStories === 1 ? "was" : "were"
-        } discarded.`
-      );
-    }
-
-    // A retry replaces the first attempt only when it is strictly cleaner.
-    if (!best || validation.hard.length < best.validation.hard.length) best = { output, validation };
-    if (validation.hard.length === 0 || retried) break;
-
-    retried = true;
-    retryFeedback = { issues: validation.hard, previousBullets: output.bullets };
-    console.log(`[RoleGen] ${label}: ${validation.hard.length} issue(s), retrying with corrections.`);
-  }
-
-  if (!best) {
-    const kept = budget.max !== null ? sourceBullets.slice(0, budget.max) : sourceBullets;
-    console.warn(`[RoleGen] ${label}: all calls failed; using ${kept.length} source bullet(s).`);
-    return {
-      ...identity,
-      bullets: kept,
-      star_stories: [],
-      generation: {
-        model_calls: modelCalls,
-        retried,
-        fallback: true,
-        budget: budget.label,
-        star_quota: starQuota,
-        issues: ["generation failed; the source bullets were used"],
-      },
-    };
-  }
-
-  const issues = [...best.validation.hard, ...best.validation.soft];
-  console.log(
-    `[RoleGen] ${label}: ${best.output.bullets.length} bullet(s) for budget ${budget.label ?? "unset"}, ` +
-      `${best.output.star_stories.length} STAR, ${modelCalls} call(s)` +
-      (issues.length > 0 ? `; remaining: ${issues.join(" | ")}` : "")
-  );
-  return {
-    ...identity,
-    bullets: best.output.bullets,
-    star_stories: best.output.star_stories,
-    generation: {
-      model_calls: modelCalls,
-      retried,
-      fallback: false,
-      budget: budget.label,
-      star_quota: starQuota,
-      issues,
-    },
-  };
-}
 
 export async function generatePerRole(
-  experience: any[],
-  geminiKey: string,
-  targetCompany?: string,
+  experience: any[], 
+  geminiKey: string, 
+  targetCompany?: string, 
   targetRole?: string,
   audience?: string,
   mode?: string,
   customPrompt?: string,
-  brainDump?: string,
-  options: GeneratePerRoleOptions = {}
-): Promise<RoleGenerationResult[]> {
-  const roles = Array.isArray(experience) ? experience : [];
-  const callModel = geminiCaller(new GoogleGenAI({ apiKey: geminiKey }));
-  const shared: SharedPromptOptions = {
-    targetRole,
-    targetCompany,
-    audience,
-    mode,
-    customPrompt,
-    brainDump,
-    jobDescription: options.jobDescription,
-    jdKeywords: options.jdKeywords,
-    extraRules: [TERMINOLOGY_RULE],
-    currentDate: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
-  };
+  brainDump?: string
+) {
+  const genAI = new GoogleGenAI({ apiKey: geminiKey });
 
-  return Promise.all(roles.map((role, index) => generateRole(callModel, role, index, shared)));
-}
+  const promises = experience.map(async (role, index) => {
+    const prompt = `
+ACT AS:
+You are a Principal Resume Intelligence Architect and FAANG Recruiter.
+Your objective is to rewrite this specific role into a recruiter-safe, technically mature, and human-written document that reflects factual realism.
 
-function competencyKey(story: any): string {
-  return asText(story?.competency).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-}
+Target Role: ${targetRole || 'Professional'}.
+Audience: ${audience || 'Recruiters'}. Mode: ${mode || 'Standard'}.
+${customPrompt ? `Custom Instructions: ${customPrompt}` : ''}
+${brainDump ? `ADDITIONAL CONTEXT (BRAIN DUMP): ${brainDump}\nSift through this raw data to extract hidden achievements.` : ''}
 
-/**
- * Chooses the document's interview-prep stories from the per-role drafts: the recent
- * roles first, then one story per role per pass in document order, with distinct
- * competencies preferred because each interviewer in a loop is assigned different ones.
- */
-export function selectStarStories(
-  roleResults: Array<{ star_stories?: any[]; generation?: { star_quota?: number } }>,
-  limit = MAX_STAR_STORIES
-): any[] {
-  const results = Array.isArray(roleResults) ? roleResults : [];
-  const isRecent = (r: { generation?: { star_quota?: number } }) => (r?.generation?.star_quota ?? 0) >= 2;
-  const ordered = [...results.filter(isRecent), ...results.filter((r) => !isRecent(r))];
-  const queues = ordered.map((r) => (Array.isArray(r?.star_stories) ? r.star_stories.filter(Boolean) : []));
+ROLE DATA:
+${JSON.stringify(role)}
 
-  const picked: any[] = [];
-  const deferred: any[] = [];
-  const competencies = new Set<string>();
+CORPORATE DNA TAILORING (DEMONSTRATE, DO NOT DECLARE):
+${targetCompany ? `Tailor appropriately for ${targetCompany}. Focus on specific impacts and technologies relevant to their industry.` : ''}
 
-  for (let pass = 0; picked.length < limit; pass++) {
-    let found = false;
-    for (const queue of queues) {
-      if (picked.length >= limit) break;
-      const story = queue[pass];
-      if (!story) continue;
-      found = true;
-      const key = competencyKey(story);
-      if (key && competencies.has(key)) {
-        deferred.push(story);
-        continue;
+STRICT OPERATIONAL REALISM RULES (GLOBAL SYSTEM RULES):
+1. TRUTHFULNESS IS MANDATORY: NEVER fabricate metrics, budget numbers, or leadership ownership. (Use ONLY provided role data).
+2. AI-GENERATED LANGUAGE PREVENTION: DO NOT use "Spearheaded", "Orchestrated", "Pioneered". Use "Managed", "Implemented", "Coordinated", "Optimized", "Configured", "Automated".
+3. THE FAANG Standard (Google XYZ): EVERY single bullet point MUST follow Google's XYZ formula: 'Accomplished [X] as measured by [Y], by doing [Z]'. Bullets can span 1 to 2 lines maximum. Be highly technical, metric-driven, and dense. Do not use filler words.
+4. ROLE-SPECIFIC COUNTS:
+   - RECENT ROLES (2022–Present): Strictly 5 to 6 XYZ bullet points.
+   - MID-CAREER (2017–2022): Strictly 3 to 4 XYZ bullet points.
+   - OLDER ROLES (Before 2017): Strictly 1 brief XYZ bullet point focusing only on the core outcome.
+5. DETAIL: Each bullet should be impactful, technical, and dense. Provide specific technical context and outcomes within the 1-2 line limit.
+6. DEVOPS BAN: The terms "CI/CD", "Pipelines", and "DevOps" are ABSOLUTELY FORBIDDEN. Use "Infrastructure Automation", "Workflow Orchestration", or "Release Engineering".
+7. PROJECT FIDELITY: Limit descriptions to 2 sentences or 25 words.
+
+OUTPUT SCHEMA:
+Return ONLY a valid JSON array of strings containing the high-impact bullet points for this role. Example: ["Bullet 1", "Bullet 2"]
+`;
+
+    const maxRetries = 3;
+    let retryCount = 0;
+    
+    while (retryCount < maxRetries) {
+      try {
+        let currentModel = "gemini-3.5-flash"; // Switched to Flash for cost efficiency
+        let res;
+        try {
+          res = await genAI.models.generateContent({
+            model: currentModel,
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            config: { 
+              responseMimeType: "application/json",
+              // Use LOW thinking or none for bullets to save costs
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+            }
+          });
+        } catch (e) {
+          console.warn(`[RoleGen] ${currentModel} failed, trying fallback...`);
+          currentModel = "gemini-3.1-flash-lite";
+          res = await genAI.models.generateContent({
+            model: currentModel,
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            config: { responseMimeType: "application/json" }
+          });
+        }
+
+        const text = res.text || "[]";
+        let bullets = [];
+        try {
+          const parsed = JSON.parse(text);
+          bullets = Array.isArray(parsed) ? parsed : (parsed.bullets || []);
+        } catch (e) {
+          console.error(`[RoleGen] JSON Parse error for ${role.id || index}:`, e);
+          throw e; // Trigger retry
+        }
+
+        return {
+          id: role.id || `role_${index + 1}`,
+          role: role.role,
+          company: role.company,
+          duration: role.duration,
+          bullets: bullets
+        };
+      } catch (err) {
+        retryCount++;
+        console.warn(`[RoleGen] Failed for ${role.id || index}. Retry ${retryCount}/${maxRetries}...`, err);
+        if (retryCount >= maxRetries) {
+          return {
+            id: role.id || `role_${index + 1}`,
+            role: role.role,
+            company: role.company,
+            duration: role.duration,
+            bullets: role.original_bullets || []
+          };
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
       }
-      if (key) competencies.add(key);
-      picked.push(story);
     }
-    if (!found) break;
-  }
-  for (const story of deferred) {
-    if (picked.length >= limit) break;
-    picked.push(story);
-  }
-  return picked;
+    
+    // Fallback if loop ends (should not happen due to return in loop)
+    return {
+      id: role.id || `role_${index + 1}`,
+      role: role.role,
+      company: role.company,
+      duration: role.duration,
+      bullets: role.original_bullets || []
+    };
+  });
+
+  return Promise.all(promises);
 }

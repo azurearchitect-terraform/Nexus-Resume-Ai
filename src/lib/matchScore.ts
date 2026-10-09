@@ -255,7 +255,6 @@ const HARD_SKILLS: string[] = [
   "Disaster Recovery|dr planning|bcdr|disaster recovery planning",
   "Business Continuity|business continuity planning|bcp",
   "Backup and Recovery|backup and restore|backups|data backup|backup solutions|backup systems",
-  "Veeam|veeam backup", "Commvault", "Rubrik", "Cohesity", "Acronis", "Veritas NetBackup|netbackup",
   "Performance Tuning|performance optimization|performance optimisation",
   "Capacity Planning|capacity management",
   "Cost Optimization|cost optimisation|cloud cost optimization|cloud cost management|cost management|cost reduction",
@@ -1498,44 +1497,4 @@ export function describeMatchScore(result: MatchScoreResult): string {
   return result.components
     .map((c) => `${c.label}: ${c.score}% (weight ${Math.round(c.weight * 100)}%) - ${c.detail}`)
     .join("\n");
-}
-
-/**
- * Named tools, platforms and technologies in a short text such as one resume bullet.
- *
- * Soft skills never count, and a lexicon phrase only counts when it is written as a
- * name (capitalised, or carrying digits/symbols) somewhere other than the opening
- * word - so "Automated Terraform plans" names Terraform, while "automated" and
- * "monitoring" stay practices rather than systems.
- */
-export function namedTechnologies(text: string): string[] {
-  const lexicon = getLexicon();
-  const normalized = normalizeText(text);
-  const found = new Set<string>();
-
-  for (const entry of lexicon.patternEntries) {
-    if (!entry.soft && entry.patterns.some((pattern) => pattern.test(normalized))) found.add(entry.name);
-  }
-
-  let isOpeningToken = true;
-  for (const segment of splitSegments(normalized)) {
-    const raw = rawTokens(segment);
-    const stems = raw.map((token) => stem(token.toLowerCase()));
-    for (let i = 0; i < stems.length; ) {
-      let length = 0;
-      for (let n = Math.min(lexicon.maxPhraseLength, stems.length - i); n >= 1; n--) {
-        const entry = lexicon.phraseIndex.get(stems.slice(i, i + n).join(" "));
-        if (entry) {
-          // Multi-word names ("load balancer", "data warehouse") are specific even in lowercase.
-          const writtenAsName = /^[A-Z0-9.]/.test(raw[i]) || /[0-9+#]/.test(raw[i]) || n >= 2;
-          if (!entry.soft && writtenAsName && !(isOpeningToken && i === 0)) found.add(entry.name);
-          length = n;
-          break;
-        }
-      }
-      i += length > 0 ? length : 1;
-    }
-    if (raw.length > 0) isOpeningToken = false;
-  }
-  return [...found];
 }

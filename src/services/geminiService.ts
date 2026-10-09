@@ -6,9 +6,8 @@ import { MasterResume, SuitabilityResult, Certification, StarStory, AuditReport 
 import { doc, getDoc, getDocFromServer } from "firebase/firestore";
 import { db, auth } from "../firebase";
 import { categorizeSkills } from "../lib/skillCategorizer";
-import { buildResumeGenerationPrompt, resolvePromptCompany } from "../lib/resumePrompt";
+import { buildResumeGenerationPrompt } from "../lib/resumePrompt";
 import { computeMatchScore, MatchScoreOptions, MatchScoreResult } from "../lib/matchScore";
-import { applyImpactAudit, computeImpactScore, resumeForAudit, ImpactScoreResult } from "../lib/impactScore";
 
 export interface OptimizationResult {
   personal_info: {
@@ -51,8 +50,6 @@ export interface OptimizationResult {
   why_this_job?: string;
   rejection_reasons?: string[];
   star_stories?: StarStory[];
-  /** Computed FAANG/STAR bullet-quality audit of the rewrite; absent when there are too few bullets. */
-  impact_audit?: ImpactScoreResult;
   audit_report?: AuditReport;
   _usage?: {
     promptTokenCount: number;
@@ -431,14 +428,6 @@ Return ONLY a JSON object with the following structure:
     } catch (scoreError) {
       console.warn("[MatchScore] Could not compute suitability score:", scoreError);
     }
-    // Bullet quality of the resume as it stands: half of "FAANG ready", independent of the JD.
-    try {
-      const document = resumeForAudit(resumeText);
-      const impact = document ? computeImpactScore(document, { expectStarStories: false }) : null;
-      if (impact) parsed.impactAudit = impact;
-    } catch (auditError) {
-      console.warn("[ImpactAudit] Could not audit the resume:", auditError);
-    }
     return parsed;
   } catch (error) {
     console.error("Error evaluating suitability:", error);
@@ -541,31 +530,21 @@ function reconcileExperience(resumeText: string, aiExperience: any): any[] {
   return output;
 }
 
-interface AnalysisOptions extends MatchScoreOptions {
-  /** The candidate's own material besides the resume; figures stated here count as theirs. */
-  brainDump?: string;
-  customPrompt?: string;
-}
-
 /**
- * Replaces any model-written scores with ones computed from the documents:
- *  - match_score / baseline_score: JD alignment of the rewrite and of the resume as
- *    submitted. Left unset when there is no job description text to score against,
- *    rather than showing a number that measures nothing.
- *  - impact_audit: the FAANG/STAR bullet-quality audit of the rewrite, with every
- *    figure traced back to the candidate's own material; STAR stories that expand no
- *    bullet are removed. Its baseline_score rates the resume as submitted.
+ * Replaces any model-written scores with scores computed from the documents.
+ * baseline_score rates the resume as submitted; match_score rates the rewrite.
+ * Both are left unset when there is no job description text to score against,
+ * rather than showing a number that measures nothing.
  */
-function applyDeterministicAnalysis(
+function applyComputedMatchScores(
   result: any,
   sourceResume: string,
   jobDescription: string,
-  options: AnalysisOptions
+  options: MatchScoreOptions
 ): any {
   delete result.match_score;
   delete result.baseline_score;
   delete result.match_analysis;
-  delete result.impact_audit;
 
   try {
     const baseline = computeMatchScore(sourceResume, jobDescription, options);
@@ -578,20 +557,6 @@ function applyDeterministicAnalysis(
   } catch (error) {
     // A scoring fault must not discard (or re-bill) a finished rewrite.
     console.warn("[MatchScore] Could not compute match score:", error);
-  }
-
-  try {
-    const sourceText = [sourceResume, options.brainDump, options.customPrompt]
-      .filter((part) => typeof part === "string" && part.trim().length > 0)
-      .join("\n\n");
-    applyImpactAudit(result, { sourceText });
-    if (result.impact_audit) {
-      const sourceDocument = resumeForAudit(sourceResume);
-      const baseline = sourceDocument ? computeImpactScore(sourceDocument, { expectStarStories: false }) : null;
-      result.impact_audit.baseline_score = baseline ? baseline.score : null;
-    }
-  } catch (error) {
-    console.warn("[ImpactAudit] Could not audit the rewrite:", error);
   }
   return result;
 }
@@ -615,10 +580,7 @@ export async function optimizeResume(
   companyName?: string
 ): Promise<OptimizationResult> {
   const routedConfig = routeTask(recruiterSimulationMode ? 'recruiter_simulation' : 'rewrite_resume', config);
-  const analysisOptions: AnalysisOptions = { targetRole, companyName, brainDump, customPrompt };
-  // "Generic Tech" in the picker falls back to the hiring company, so a posting at Amazon
-  // still gets Amazon's Leadership Principles as the STAR framework.
-  const promptCompany = resolvePromptCompany(targetCompany, companyName);
+  const scoreOptions: MatchScoreOptions = { targetRole, companyName };
   
   // Cost-saving logic: If fastMode is enabled, prefer Gemini Flash even in Hybrid mode to reduce OpenAI costs
   let modelToUse = routedConfig.model;
@@ -656,7 +618,7 @@ export async function optimizeResume(
           customPrompt,
           apiKey: config.openaiConfig.apiKey,
           pipelineType,
-          targetCompany: promptCompany,
+          targetCompany,
           brainDump
         })
       });
@@ -725,7 +687,7 @@ export async function optimizeResume(
           return obj;
         };
 
-        return applyDeterministicAnalysis(fixTitle(parsed), resumeText, jobDescription, analysisOptions);
+        return applyComputedMatchScores(fixTitle(parsed), resumeText, jobDescription, scoreOptions);
       }
     } catch (e) {
       console.warn("V2 Pipeline failed, falling back to legacy optimization:", e);
@@ -736,7 +698,7 @@ export async function optimizeResume(
     targetRole,
     audience,
     mode,
-    targetCompany: promptCompany,
+    targetCompany,
     customPrompt,
     brainDump,
     recruiterSimulationMode,
@@ -819,7 +781,7 @@ export async function optimizeResume(
           return obj;
         };
 
-        return applyDeterministicAnalysis(fixTitle(parsed), resumeText, jobDescription, analysisOptions);
+        return applyComputedMatchScores(fixTitle(parsed), resumeText, jobDescription, scoreOptions);
       } catch (e) {
         console.error(`Error parsing ${engineToUse} response:`, e, "Raw text:", resultText);
         throw new Error(`JSON_PARSING_ERROR: The ${engineToUse} engine returned an invalid response format.`);
