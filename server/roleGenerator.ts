@@ -1,4 +1,14 @@
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import { activeBulletRules, describeBudgetRules } from "../src/lib/bulletBudget";
+import type { BudgetPlan, BulletRules } from "../src/lib/bulletBudget";
+import { buildTrendBrief, trendEvidenceText } from "../src/lib/linkedinTrends";
+import type { LinkedInTrends } from "../src/lib/linkedinTrends";
+
+interface RoleGenerationOptions {
+  budgetPlan?: BudgetPlan;
+  bulletRules?: BulletRules | null;
+  trends?: LinkedInTrends | null;
+}
 
 export async function generatePerRole(
   experience: any[], 
@@ -8,11 +18,23 @@ export async function generatePerRole(
   audience?: string,
   mode?: string,
   customPrompt?: string,
-  brainDump?: string
+  brainDump?: string,
+  options: RoleGenerationOptions = {}
 ) {
   const genAI = new GoogleGenAI({ apiKey: geminiKey });
 
   const promises = experience.map(async (role, index) => {
+    const budget = options.budgetPlan?.budgets[index];
+    const rules = activeBulletRules(options.bulletRules);
+    const roleTrendBrief = options.trends
+      ? buildTrendBrief(options.trends, {
+          scope: "role",
+          evidenceText: trendEvidenceText(role, brainDump),
+        })
+      : "";
+    const budgetInstruction = budget
+      ? `BULLET BUDGET: ${budget.label ?? `model decides, never more than ${budget.max}`} bullets (${budget.reason}). This ceiling is mandatory. Do not add or invent bullets to meet a minimum.${rules ? `\n${describeBudgetRules("   ", { rules, platform: options.budgetPlan?.platform })}` : ""}`
+      : "";
     const prompt = `
 ACT AS:
 You are a Principal Resume Intelligence Architect and FAANG Recruiter.
@@ -25,6 +47,8 @@ ${brainDump ? `ADDITIONAL CONTEXT (BRAIN DUMP): ${brainDump}\nSift through this 
 
 ROLE DATA:
 ${JSON.stringify(role)}
+${budgetInstruction}
+${roleTrendBrief}
 
 CORPORATE DNA TAILORING (DEMONSTRATE, DO NOT DECLARE):
 ${targetCompany ? `Tailor appropriately for ${targetCompany}. Focus on specific impacts and technologies relevant to their industry.` : ''}
@@ -33,10 +57,8 @@ STRICT OPERATIONAL REALISM RULES (GLOBAL SYSTEM RULES):
 1. TRUTHFULNESS IS MANDATORY: NEVER fabricate metrics, budget numbers, or leadership ownership. (Use ONLY provided role data).
 2. AI-GENERATED LANGUAGE PREVENTION: DO NOT use "Spearheaded", "Orchestrated", "Pioneered". Use "Managed", "Implemented", "Coordinated", "Optimized", "Configured", "Automated".
 3. THE FAANG Standard (Google XYZ): EVERY single bullet point MUST follow Google's XYZ formula: 'Accomplished [X] as measured by [Y], by doing [Z]'. Bullets can span 1 to 2 lines maximum. Be highly technical, metric-driven, and dense. Do not use filler words.
-4. ROLE-SPECIFIC COUNTS:
-   - RECENT ROLES (2022–Present): Strictly 5 to 6 XYZ bullet points.
-   - MID-CAREER (2017–2022): Strictly 3 to 4 XYZ bullet points.
-   - OLDER ROLES (Before 2017): Strictly 1 brief XYZ bullet point focusing only on the core outcome.
+4. ROLE-SPECIFIC COUNTS: Follow the BULLET BUDGET above exactly. If no budget is supplied,
+   keep the count proportionate to tenure and recency. Never pad a role to reach a minimum.
 5. DETAIL: Each bullet should be impactful, technical, and dense. Provide specific technical context and outcomes within the 1-2 line limit.
 6. DEVOPS BAN: The terms "CI/CD", "Pipelines", and "DevOps" are ABSOLUTELY FORBIDDEN. Use "Infrastructure Automation", "Workflow Orchestration", or "Release Engineering".
 7. PROJECT FIDELITY: Limit descriptions to 2 sentences or 25 words.

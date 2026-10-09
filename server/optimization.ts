@@ -2,6 +2,8 @@ import crypto from 'crypto';
 import { GoogleGenAI } from "@google/genai";
 import OpenAI from "openai";
 import { pipelineCache } from './cacheUtility';
+import { planBulletBudgets } from "../src/lib/bulletBudget";
+import type { BudgetOptions } from "../src/lib/bulletBudget";
 
 /**
  * Token Optimization Strategy
@@ -95,7 +97,7 @@ export async function extractRelevantResumeData(resumeText: string, geminiApiKey
         { "title": "Project Name", "description": "Full Description" }
       ],
       "education": [
-        { "degree": "e.g. B.Tech in Computer Science", "institution": "e.g. Stanford University", "expected_completion": "e.g. 2018" },
+        { "degree": "e.g. B.Tech in Computer Science", "institution": "e.g. Stanford University", "semester": "e.g. 5, only if the source states it", "expected_completion": "e.g. 2018" },
         "Or just string representing school and degree"
       ],
       "certifications": [
@@ -334,7 +336,7 @@ export function suggestBulletBudget(duration: string, isMostRecent: boolean): st
   return "2-3";
 }
 
-export function trimContentForAI(resumeData: any, keywords: string[]) {
+export function trimContentForAI(resumeData: any, keywords: string[], budgetOptions: BudgetOptions = {}) {
   // Remove duplicates from skills and achievements
   const seenSkills = new Set<string>();
   const uniqueSkills = (resumeData.skills || []).filter((s: string) => {
@@ -345,24 +347,27 @@ export function trimContentForAI(resumeData: any, keywords: string[]) {
   });
 
     // Ensure we don't exceed reasonable limits but provide enough for Step 3
+    const sourceRoles = (resumeData.experience || []).map((exp: any, index: number) => ({
+      ...exp,
+      id: `role_${index + 1}`,
+      bullets: exp.achievements || [],
+    }));
+    const budgetPlan = planBulletBudgets(sourceRoles, budgetOptions);
     return {
       personal_info: resumeData.personal_info || {},
       // Trim summary to reasonable length for prompt safety
       summary: resumeData.summary?.substring(0, 1200),
       skills: uniqueSkills.slice(0, 100),
-      experience: (resumeData.experience || []).map((exp: any, index: number) => {
+      experience: sourceRoles.map((exp: any, index: number) => {
         const seenBullets = new Set<string>();
-        const tenureMonths = parseTenureMonths(exp.duration);
-        const bulletBudget = suggestBulletBudget(exp.duration, index === 0);
+        const budget = budgetPlan.budgets[index];
         return {
           id: `role_${index + 1}`,
           role: exp.role,
           company: exp.company,
           duration: exp.duration,
-          // Computed here rather than left to the model, which is unreliable at
-          // date arithmetic. Omitted entirely when the duration is unparseable.
-          ...(tenureMonths !== null ? { tenure_months: tenureMonths } : {}),
-          ...(bulletBudget !== null ? { bullet_budget: bulletBudget } : {}),
+          ...(budget.tenureMonths !== null ? { tenure_months: budget.tenureMonths } : {}),
+          ...(budget.label !== null ? { bullet_budget: budget.label } : {}),
           // Remove duplicate bullets and provide more context for AI selection
           original_bullets: (exp.achievements || [])
             .filter((a: string) => {

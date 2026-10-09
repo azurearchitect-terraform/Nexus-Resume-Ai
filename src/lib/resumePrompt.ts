@@ -8,6 +8,9 @@
  * Keep this module dependency-free: it is bundled by both esbuild (node) and vite (browser).
  */
 
+import { activeBulletRules, describeBudgetRules, formatBudgetTable } from "./bulletBudget";
+import type { BulletBudget, BulletRules, PlatformDecision } from "./bulletBudget";
+
 export interface ResumePromptOptions {
   targetRole: string;
   audience: string;
@@ -27,6 +30,10 @@ export interface ResumePromptOptions {
   currentDate?: string;
   /** Hiring-manager rejection review instead of a rewrite. */
   recruiterSimulationMode?: boolean;
+  bulletBudgets?: BulletBudget[];
+  bulletRules?: BulletRules | null;
+  platformDecision?: PlatformDecision | null;
+  trendBrief?: string;
 }
 
 const BANNED_VERBS = [
@@ -87,7 +94,7 @@ const OUTPUT_SCHEMA = `{
   "skills": { "Category 1": ["string"], "Category 2": ["string"], "Category 3": ["string"], "Category 4": ["string"] },
   "experience": [ { "id": "string", "role": "string", "company": "string", "duration": "string", "bullets": ["string"] } ],
   "projects": [ { "title": "string", "description": "string" } ],
-  "education": [ { "degree": "string", "institution": "string", "expected_completion": "string" } ],
+  "education": [ { "degree": "string", "institution": "string", "semester": "string, only if the source states it", "expected_completion": "string" } ],
   "certifications": [ { "name": "string", "issuer": "string", "date": "string" } ],
   "ats_keywords_from_jd": ["string"],
   "ats_keywords_added_to_resume": ["string"],
@@ -129,7 +136,21 @@ export function buildResumeGenerationPrompt(options: ResumePromptOptions): strin
       day: "numeric",
     }),
     recruiterSimulationMode = false,
+    bulletBudgets,
+    bulletRules,
+    platformDecision,
+    trendBrief,
   } = options;
+
+  const activeRules = activeBulletRules(bulletRules);
+  const budgetSection = activeRules
+    ? `${describeBudgetRules("   ", { rules: activeRules, platform: platformDecision })}
+   Per-role budgets (authoritative; never add bullets to reach a minimum):
+${formatBudgetTable(bulletBudgets || [], "   ", { markSource: true })}`
+    : `If a role carries a "bullet_budget" field, that value is authoritative. Otherwise derive
+   counts from tenure: under 3 months: 1; 3-12 months: 2-3; over 1 year, current/most recent:
+   6-7; over 1 year, earlier: 3-4; roles ending more than 10 years ago: 1-2. For unreadable
+   dates use a proportionate count, never more than 7. Never pad or invent bullets.`;
 
   const dnaKey = (targetCompany || "").toLowerCase();
   const corporateDna =
@@ -217,25 +238,10 @@ HARD CONSTRAINTS (violating any of these is a critical failure):
 3. PRESERVE ALL CERTIFICATIONS AND TITLES verbatim, including issuer and date. Never
    normalise, "correct", re-case, or abbreviate a job title or company name.
 
-4. BULLET BUDGET - TENURE FIRST, THEN RECENCY (trim wording, never roles):
-   If a role in the input carries a "bullet_budget" field, that value is AUTHORITATIVE -
-   produce exactly that many bullets for that role. It was computed from the actual dates
-   and overrides every heuristic below.
-   Where no "bullet_budget" is given, derive tenure from the duration field and apply:
-   - Under 3 months:        exactly 1 bullet, single line
-   - 3 to 12 months:        2-3 bullets
-   - Over 1 year, current or most recent role:  6-7 bullets
-   - Over 1 year, earlier roles:                3-4 bullets
-   - Anything before the last ~10 years:        1-2 bullets, core outcome only
-
-   ANTI-PADDING RULE: bullet count must stay proportionate to time served. A long list
-   under a short stint reads as padding, invites scrutiny of the entire document, and is
-   a worse outcome than saying less. Never inflate a brief role to match the depth of a
-   multi-year one, however senior the title or well known the employer. For a stint under
-   three months, state the single thing that was actually delivered and stop.
-
-   Depth belongs to the roles that earned it: give substantial, long-tenure positions the
-   fullest treatment, and let short ones stay deliberately thin.
+4. BULLET BUDGET (trim wording, never roles):
+${budgetSection}
+   Never pad a role or invent a bullet to meet a minimum. Remove the weakest bullets from
+   older, system-budgeted roles first when fitting the document.
    The total document must fit 1-2 pages, achieved by trimming bullets and tightening
    wording ONLY. Rule 1 always wins over this rule.
 
@@ -297,7 +303,7 @@ HARD CONSTRAINTS (violating any of these is a critical failure):
 ${section(
     jdKeywords && jdKeywords.length > 0,
     `    Priority JD keywords: ${(jdKeywords || []).join(", ")}.`
-  )}
+  )}${section(trendBrief, `\n${trendBrief}`)}
 
 12. HUMANIZATION. The document must read as if a competent engineer wrote it under time
     pressure - specific, uneven, and concrete - not as a uniformly polished template.

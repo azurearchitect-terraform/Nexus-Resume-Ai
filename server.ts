@@ -22,6 +22,20 @@ import { generatePerRole } from "./server/roleGenerator";
 import { deduplicateAndScore } from "./server/dedup";
 import { saveResumeVersion } from "./server/memory";
 import { buildResumeGenerationPrompt } from "./src/lib/resumePrompt";
+import {
+  activeBulletRules,
+  bulletRulesFingerprint,
+  enforceBulletBudgets,
+  planBulletBudgets,
+} from "./src/lib/bulletBudget";
+import {
+  activeLinkedInTrends,
+  applyTrendCoverage,
+  buildTrendBrief,
+  trendEvidenceText,
+  trendFingerprint,
+  trendPreferTerms,
+} from "./src/lib/linkedinTrends";
 // import { scrapeJobs } from "./server/jobScraper";
 
 dotenv.config();
@@ -216,7 +230,7 @@ function decrypt(text: string) {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(cors());
   app.use(bodyParser.json({ limit: '50mb' }));
@@ -755,12 +769,17 @@ async function startServer() {
       pipelineType,
       targetCompany,
       brainDump,
-      apiKey
+      apiKey,
+      requestedBulletRules,
+      linkedinTrends
     } = req.body;
 
     if (!resumeText || !jobDescription) {
       return res.status(400).json({ error: "Missing required fields" });
     }
+
+    const bulletRules = activeBulletRules(requestedBulletRules);
+    const trends = activeLinkedInTrends(linkedinTrends, targetRole, jobDescription);
 
     try {
       // 1. Fetch keys securely from Firestore
@@ -828,7 +847,9 @@ async function startServer() {
         customPrompt,
         pipelineType: selectedPipeline,
         hasGemini: !!geminiKey,
-        hasOpenAI: !!openaiKey
+        hasOpenAI: !!openaiKey,
+        ...(bulletRules ? { bulletRules: bulletRulesFingerprint(bulletRules) } : {}),
+        ...(trends ? { linkedinTrends: trendFingerprint(trends) } : {})
       });
       
       const cachedResult = pipelineCache.get(cacheKey);
@@ -873,7 +894,15 @@ async function startServer() {
 
       // STEP 2: Internal Logic (Free) - Trimming
       console.log("[Pipeline] Step 2: Trimming Content...");
-      const optimizedInput = Optimization.trimContentForAI(resumeData, jdKeywords);
+      const budgetOptions = { now: new Date(), rules: bulletRules, jobDescription };
+      const optimizedInput = Optimization.trimContentForAI(resumeData, jdKeywords, budgetOptions);
+      const budgetPlan = planBulletBudgets(optimizedInput.experience, budgetOptions);
+      const trendBrief = trends
+        ? buildTrendBrief(trends, {
+            scope: "document",
+            evidenceText: trendEvidenceText(resumeText, brainDump),
+          })
+        : "";
       
       console.log("=== OPTIMIZED INPUT EXPERIENCE ===");
       console.dir(optimizedInput.experience, { depth: null });
@@ -896,6 +925,10 @@ async function startServer() {
         jobDescription: Optimization.trimInput(jobDescription, 6000),
         inputLabel: "INPUT DATA (structured, pre-extracted and trimmed)",
         inputData: JSON.stringify(optimizedInput, null, 2),
+        bulletBudgets: budgetPlan.budgets,
+        bulletRules: budgetPlan.rules,
+        platformDecision: budgetPlan.platform,
+        trendBrief,
       });
 
       let result;
@@ -1013,8 +1046,10 @@ async function startServer() {
 
           Target Role: ${targetRole}.
           Audience: ${audience}. Mode: ${mode}.
+          ${customPrompt ? `READER GUIDANCE AND CUSTOM INSTRUCTIONS (emphasis only, never evidence): ${customPrompt}` : ''}
           Keywords: ${optimizedInput.jd_keywords.join(', ')}.
           ${brainDump ? `ADDITIONAL CONTEXT (BRAIN DUMP): ${brainDump}` : ''}
+          ${trendBrief}
           
           INPUT DATA:
           ${JSON.stringify({
@@ -1044,7 +1079,7 @@ async function startServer() {
             "skills": { "Category 1": ["skill1", ...], ... },
             "why_this_job": "...",
             "projects": [ { "title": "...", "description": "..." } ],
-            "education": [ { "degree": "...", "institution": "...", "expected_completion": "..." } ],
+            "education": [ { "degree": "...", "institution": "...", "semester": "... (only if the source states it)", "expected_completion": "..." } ],
             "certifications": [...],
             "ats_keywords_from_jd": [...],
             "ats_keywords_added_to_resume": [...],
@@ -1075,7 +1110,8 @@ async function startServer() {
             audience,
             mode,
             customPrompt,
-            brainDump
+            brainDump,
+            { budgetPlan, bulletRules: budgetPlan.rules, trends }
           )
         ]);
 
@@ -1124,6 +1160,28 @@ async function startServer() {
       }
     }
     
+    if (result?.result) {
+      const parsedResult = JSON.parse(result.result);
+      if (trends) delete parsedResult.linkedin_trends;
+      enforceBulletBudgets(parsedResult, {
+        sourceText: [resumeText, brainDump].filter(Boolean).join("\n\n"),
+        rules: budgetPlan.rules,
+        jobDescription,
+        sourceRoles: optimizedInput.experience,
+        now: budgetOptions.now,
+        ...(trends
+          ? { preferTerms: trendPreferTerms(trends, trendEvidenceText(resumeText, brainDump)) }
+          : {}),
+      });
+      if (trends) {
+        applyTrendCoverage(parsedResult, trends, {
+          sourceText: resumeText,
+          extraEvidence: brainDump ? [brainDump] : [],
+        });
+      }
+      result.result = JSON.stringify(parsedResult);
+    }
+
     // STEP 5: Cache Result (Merged/Unified)
     if (result) {
       Optimization.saveToCache(cacheKey, result);
@@ -1483,6 +1541,13 @@ async function startServer() {
     if (!html) {
       return res.status(400).json({ error: "HTML content is required" });
     }
+    if (/\[(?:REDACTED|MASKED)\b/i.test(html)) {
+      return res.status(400).json({ error: "Turn off PII masking before exporting a resume." });
+    }
+    const safeLayout = /class=["'][^"']*\bats-safe-resume\b/i.test(html);
+    const safeDocumentTitle = String(title || "Resume").replace(/[\x00-\x1f\x7f]/g, "")
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 
     let browser;
     try {
@@ -1504,7 +1569,7 @@ async function startServer() {
         <html>
           <head>
             <meta charset="UTF-8">
-            <title>${String(title || 'Resume').replace(/[<>]/g, '')}</title>
+            <title>${safeDocumentTitle}</title>
             <style>
               /* 1. ATS-SAFE, LOCALLY-RESOLVABLE FONT STACK
                  We deliberately do NOT use a Google web font here. Chrome's PDF
@@ -1628,6 +1693,11 @@ async function startServer() {
                 -webkit-text-fill-color: currentColor !important;
                 -webkit-text-stroke: 0 !important;
               }
+              #resume-container .resume-contact { text-align: center !important; }
+              #resume-container .resume-keep {
+                break-inside: avoid !important;
+                page-break-inside: avoid !important;
+              }
             </style>
           </head>
           <body>
@@ -1644,22 +1714,31 @@ async function startServer() {
 
       // Wait for Google Fonts to load
       await page.evaluateHandle('document.fonts.ready');
+      await page.emulateMediaType("print");
 
-      // Hard 2-page guarantee.
+      // Prefer two pages, while preserving every block and the readable text floor.
       //
       // The frontend can only estimate a fit factor from the on-screen preview,
       // which has different geometry from the print box - so an estimate alone
       // regularly lands on 3 pages. Instead we close the loop: render, count the
-      // pages Chrome actually produced, and binary-search for the LARGEST scale
-      // that still fits. That both guarantees the page count and keeps the text as
-      // large (and therefore as readable) as possible.
+      // pages Chrome actually produced, and binary-search for the LARGEST readable
+      // scale that fits. If the readable floor still overflows, retain extra pages.
       //
       // Shrink-to-fit uses page.pdf({ scale }) - Chrome's own print scale, which
       // repaginates correctly - rather than a CSS transform, which does not: Chrome
       // computes page breaks from the untransformed layout box, so a transform
       // shrinks the painted pixels but leaves the pagination alone.
       const MAX_PAGES = 2;
-      const MIN_SCALE = 0.5; // below this the resume stops being comfortably legible
+      const smallestTextPt = await page.evaluate(() => {
+        const sizes = Array.from(document.querySelectorAll("#resume-container *"))
+          .filter(element => Array.from(element.childNodes).some(node => node.nodeType === Node.TEXT_NODE && node.textContent?.trim()))
+          .map(element => parseFloat(getComputedStyle(element).fontSize) * 0.75)
+          .filter(size => Number.isFinite(size) && size > 0);
+        return sizes.length ? Math.min(...sizes) : 11;
+      });
+      // Keep the complete content on additional pages rather than forcing sub-10 pt text.
+      // A small cushion accounts for Chrome's fractional font-size quantization.
+      const MIN_SCALE = Math.min(1, Math.max(0.5, 10.05 / smallestTextPt));
 
       const renderAt = (s: number) => page.pdf({
         format: "A4",
@@ -1673,9 +1752,46 @@ async function startServer() {
       // Full size first - most resumes already fit and need no shrinking at all.
       let pdfBuffer = await renderAt(1);
       let pageCount = countPdfPages(pdfBuffer);
+      let density = 1;
+      let finalScale = 1;
+
+      if (pageCount > MAX_PAGES && !safeLayout) {
+        // Snapshot once so the density steps never compound or change font sizes.
+        const spacing = await page.evaluate(() => Array.from(document.querySelectorAll<HTMLElement>("#resume-container *"))
+          .map(element => {
+            const style = getComputedStyle(element);
+            return {
+              lineHeight: parseFloat(style.lineHeight), fontSize: parseFloat(style.fontSize),
+              marginTop: parseFloat(style.marginTop), marginBottom: parseFloat(style.marginBottom),
+              paddingTop: parseFloat(style.paddingTop), paddingBottom: parseFloat(style.paddingBottom),
+            };
+          }));
+        for (const factor of [0.94, 0.88]) {
+          density = factor;
+          await page.evaluate(({ spacing, factor }) => {
+            const elements = document.querySelectorAll<HTMLElement>("#resume-container *");
+            spacing.forEach((original, index) => {
+              const element = elements[index];
+              for (const property of ["marginTop", "marginBottom", "paddingTop", "paddingBottom"] as const) {
+                if (Number.isFinite(original[property]) && original[property] >= 0) {
+                  element.style.setProperty(property.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`),
+                    `${original[property] * factor}px`, "important");
+                }
+              }
+              if (Number.isFinite(original.lineHeight)) {
+                element.style.setProperty("line-height",
+                  `${Math.min(original.lineHeight, Math.max(original.fontSize * 1.2, original.lineHeight * factor))}px`, "important");
+              }
+            });
+          }, { spacing, factor });
+          pdfBuffer = await renderAt(1);
+          pageCount = countPdfPages(pdfBuffer);
+          if (pageCount > 0 && pageCount <= MAX_PAGES) break;
+        }
+      }
 
       // pageCount === 0 means the buffer couldn't be parsed; fail open and ship it.
-      if (pageCount > MAX_PAGES) {
+      if (pageCount > MAX_PAGES && !safeLayout) {
         let lo = MIN_SCALE;
         let hi = 1;
         let best: Uint8Array | null = null;
@@ -1692,14 +1808,19 @@ async function startServer() {
           const pages = countPdfPages(candidate);
           if (pages > 0 && pages <= MAX_PAGES) {
             best = candidate; // fits - try to grow back toward full size
+            finalScale = mid;
             lo = mid;
           } else {
             hi = mid; // still too long - shrink further
           }
         }
 
-        // If even MIN_SCALE overflows, emit that rather than an oversized document.
-        pdfBuffer = best ?? await renderAt(MIN_SCALE);
+        // If the readable floor still overflows, preserve the extra pages and all content.
+        if (best) pdfBuffer = best;
+        else {
+          finalScale = MIN_SCALE;
+          pdfBuffer = await renderAt(MIN_SCALE);
+        }
         pageCount = countPdfPages(pdfBuffer);
       }
 
@@ -1708,6 +1829,7 @@ async function startServer() {
       res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.pdf"`);
       res.setHeader("Content-Length", pdfBuffer.length);
       res.setHeader("X-Resume-Page-Count", String(pageCount));
+      res.setHeader("X-Resume-Layout", `density=${density}; scale=${finalScale}`);
       res.end(pdfBuffer);
 
     } catch (error: any) {

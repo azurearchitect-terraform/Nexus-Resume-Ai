@@ -51,6 +51,7 @@ export interface Education {
   institution: string;
   degree: string;
   expected_completion: string;
+  semester?: string | number;
 }
 
 export interface Project {

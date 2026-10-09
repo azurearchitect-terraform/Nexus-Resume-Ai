@@ -8,6 +8,20 @@ import { db, auth } from "../firebase";
 import { categorizeSkills } from "../lib/skillCategorizer";
 import { buildResumeGenerationPrompt } from "../lib/resumePrompt";
 import { computeMatchScore, MatchScoreOptions, MatchScoreResult } from "../lib/matchScore";
+import { activeBulletRules, enforceBulletBudgets, planBulletBudgets, rolesFromResumeText } from "../lib/bulletBudget";
+import type { BulletBudgetReport, BulletRules } from "../lib/bulletBudget";
+import {
+  activeLinkedInTrends,
+  applyTrendCoverage,
+  buildTrendBrief,
+  trendEvidenceText,
+  trendPreferTerms,
+} from "../lib/linkedinTrends";
+import type { LinkedInTrends, TrendCoverageReport } from "../lib/linkedinTrends";
+import {
+  buildAudiencePrompt, extractJdSignals, fuseAudienceDecision, jdFingerprint,
+  scoreAudiencesByRules, type AudienceDecision,
+} from "../lib/audienceIntelligence";
 
 export interface OptimizationResult {
   personal_info: {
@@ -51,6 +65,8 @@ export interface OptimizationResult {
   rejection_reasons?: string[];
   star_stories?: StarStory[];
   audit_report?: AuditReport;
+  bullet_budget_report?: BulletBudgetReport;
+  linkedin_trends?: TrendCoverageReport;
   _usage?: {
     promptTokenCount: number;
     candidatesTokenCount: number;
@@ -81,6 +97,39 @@ export interface EngineConfig {
   engine: EngineType;
   model: string;
   apiKey?: string; // This will now hold the encrypted API key
+}
+
+export interface OptimizeResumeOptions {
+  bulletRules?: BulletRules | null;
+  linkedinTrends?: boolean;
+  audienceBrief?: string;
+  /** Hiring company, so the match score does not count its own name as a skill. */
+  companyName?: string;
+}
+
+function finalizeFeatureOutput(
+  parsed: any,
+  resumeText: string,
+  jobDescription: string,
+  brainDump: string | undefined,
+  linkedInPdfText: string | undefined,
+  bulletRules: BulletRules | null,
+  trends: LinkedInTrends | null
+): void {
+  if (trends) delete parsed.linkedin_trends;
+  const evidence = [brainDump, linkedInPdfText].filter((value): value is string => Boolean(value));
+  enforceBulletBudgets(parsed, {
+    sourceText: [resumeText, ...evidence].join("\n\n"),
+    rules: bulletRules,
+    jobDescription,
+    sourceRoles: rolesFromResumeText(resumeText),
+    ...(trends
+      ? { preferTerms: trendPreferTerms(trends, trendEvidenceText(resumeText, ...evidence)) }
+      : {}),
+  });
+  if (trends) {
+    applyTrendCoverage(parsed, trends, { sourceText: resumeText, extraEvidence: evidence });
+  }
 }
 
 function extractJson(text: string): string {
@@ -577,10 +626,12 @@ export async function optimizeResume(
   pipelineType?: string,
   targetCompany?: string,
   brainDump?: string,
-  companyName?: string
+  options: OptimizeResumeOptions = {}
 ): Promise<OptimizationResult> {
   const routedConfig = routeTask(recruiterSimulationMode ? 'recruiter_simulation' : 'rewrite_resume', config);
-  const scoreOptions: MatchScoreOptions = { targetRole, companyName };
+  const bulletRules = activeBulletRules(options.bulletRules);
+  const trends = activeLinkedInTrends(options.linkedinTrends, targetRole, jobDescription);
+  const scoreOptions: MatchScoreOptions = { targetRole, companyName: options.companyName };
   
   // Cost-saving logic: If fastMode is enabled, prefer Gemini Flash even in Hybrid mode to reduce OpenAI costs
   let modelToUse = routedConfig.model;
@@ -615,11 +666,13 @@ export async function optimizeResume(
           targetRole,
           mode,
           audience,
-          customPrompt,
+          customPrompt: [customPrompt, options.audienceBrief].filter(Boolean).join("\n\n"),
           apiKey: config.openaiConfig.apiKey,
           pipelineType,
           targetCompany,
-          brainDump
+          brainDump,
+          ...(bulletRules ? { bulletRules } : {}),
+          ...(trends ? { linkedinTrends: true } : {})
         })
       });
 
@@ -668,6 +721,7 @@ export async function optimizeResume(
         // reconcile call, so without this the "never drop a job" safeguard would
         // protect only the Gemini/OpenAI engines and silently miss every Hybrid run.
         parsed.experience = reconcileExperience(resumeText, parsed.experience);
+        finalizeFeatureOutput(parsed, resumeText, jobDescription, brainDump, linkedInPdfText, bulletRules, trends);
 
         // Apply title fix to V2 results as well
         const fixTitle = (obj: any): any => {
@@ -694,17 +748,30 @@ export async function optimizeResume(
     }
   }
 
+  const sourceRoles = rolesFromResumeText(resumeText);
+  const budgetPlan = sourceRoles
+    ? planBulletBudgets(sourceRoles, { rules: bulletRules, jobDescription })
+    : undefined;
   const prompt = buildResumeGenerationPrompt({
     targetRole,
     audience,
     mode,
     targetCompany,
-    customPrompt,
+    customPrompt: [customPrompt, options.audienceBrief].filter(Boolean).join("\n\n"),
     brainDump,
     recruiterSimulationMode,
     jobDescription,
     inputLabel: "SOURCE RESUME (raw text)",
     inputData: resumeText,
+    bulletBudgets: budgetPlan?.budgets,
+    bulletRules,
+    platformDecision: budgetPlan?.platform,
+    trendBrief: trends
+      ? buildTrendBrief(trends, {
+          scope: "document",
+          evidenceText: trendEvidenceText(resumeText, brainDump, linkedInPdfText),
+        })
+      : undefined,
   });
 
   const maxRetries = 5;
@@ -757,6 +824,7 @@ export async function optimizeResume(
 
         // Guarantee no role was silently dropped to satisfy the page budget.
         parsed.experience = reconcileExperience(resumeText, parsed.experience);
+        finalizeFeatureOutput(parsed, resumeText, jobDescription, brainDump, linkedInPdfText, bulletRules, trends);
 
         if (data.usage) {
           parsed._usage = data.usage;
@@ -965,98 +1033,103 @@ export async function performSkillAssessment(
 }
 
 
-export async function analyzeBestAudiences(
+const audienceCache = new Map<string, AudienceDecision>();
+const audienceInFlight = new Map<string, Promise<AudienceDecision>>();
+const AUDIENCE_CACHE_KEY = "nexus_audience_decisions_v1";
+const CACHE_LIMIT = 8;
+const CACHE_AGE_MS = 24 * 60 * 60 * 1000;
+
+function rememberAudienceDecision(decision: AudienceDecision): void {
+  audienceCache.delete(decision.fingerprint);
+  audienceCache.set(decision.fingerprint, decision);
+  while (audienceCache.size > CACHE_LIMIT) audienceCache.delete(audienceCache.keys().next().value!);
+  try {
+    // Persist only IDs/confidence, never a posting or its verbatim evidence.
+    localStorage.setItem(AUDIENCE_CACHE_KEY, JSON.stringify([...audienceCache.values()].map((item) => ({
+      fingerprint: item.fingerprint, decidedAt: item.decidedAt, source: item.source,
+      audiences: item.audiences.map((pick) => ({ id: pick.id, confidence: pick.confidence })),
+    }))));
+  } catch (error) {
+    console.warn("[Audience] Local cache unavailable; memory cache remains active.", error instanceof Error ? error.name : "Storage error");
+  }
+}
+
+function cachedAudienceDecision(jd: string, role: string): AudienceDecision | undefined {
+  const fingerprint = jdFingerprint(jd, role);
+  const existing = audienceCache.get(fingerprint);
+  if (existing && Date.now() - Date.parse(existing.decidedAt) < CACHE_AGE_MS) return existing;
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(AUDIENCE_CACHE_KEY) || "[]");
+    if (!Array.isArray(saved)) return undefined;
+    const entry = saved.find((item) => item && item.fingerprint === fingerprint &&
+      typeof item.decidedAt === "string" && Date.now() - Date.parse(item.decidedAt) < CACHE_AGE_MS);
+    if (!entry || !Array.isArray(entry.audiences)) return undefined;
+    const signals = extractJdSignals(jd, role);
+    const rules = scoreAudiencesByRules(signals);
+    // Revalidate cached IDs against the current posting rather than trusting local storage.
+    const restored = fuseAudienceDecision(entry.source === "rules" ? null : {
+      audiences: entry.audiences.map((pick: { id?: unknown; confidence?: unknown }) => ({
+        ...pick, evidence: rules.find((item) => item.id === pick.id)?.evidence || [],
+      })),
+    }, rules, jd, role);
+    audienceCache.set(fingerprint, restored);
+    return restored;
+  } catch (error) {
+    console.warn("[Audience] Saved cache could not be read.", error instanceof Error ? error.name : "Storage error");
+    return undefined;
+  }
+}
+
+export async function analyzeAudienceDecision(
   jobDescription: string,
   targetRole: string,
   config: RouterConfig,
-  fastMode: boolean = false
-): Promise<string[]> {
-  const routedConfig = routeTask('multi_audience', config);
-  console.log('analyzeBestAudiences called', { jobDescription, targetRole });
-  
-  let modelToUse = routedConfig.model;
-  if (fastMode && routedConfig.engine === 'gemini') {
-    modelToUse = 'gemini-3.6-flash';
-  } else if (!modelToUse) {
-    modelToUse = 'gemini-3.6-flash';
+  options: { fastMode?: boolean; force?: boolean } = {}
+): Promise<AudienceDecision> {
+  const fingerprint = jdFingerprint(jobDescription, targetRole);
+  if (!options.force) {
+    const cached = cachedAudienceDecision(jobDescription, targetRole);
+    if (cached) return cached;
+    const pending = audienceInFlight.get(fingerprint);
+    if (pending) return pending;
   }
-  const prompt = `
-    Analyze the following Job Description and Target Role.
-    Select the MOST SPECIFIC and appropriate audiences from the following list that match the actual seniority and technical focus of the role:
-    - microsoft (If Azure/Microsoft stack is primary)
-    - leadership (If people management is mentioned)
-    - cloud-architect (For strategy/design roles)
-    - solution-architect (For client-facing/solution roles)
-    - consulting (For agency/consultancy roles)
-    - cloud-eng-mgr (Engineering management)
-    - infra-mgr (Infrastructure management)
-    - assoc-director (Junior leadership)
-    - director-mid (Middle management / Head of Cloud for mid-size)
-    - director-large (Head of Cloud for large enterprise)
-    - principal-architect (Highest level individual contributor)
-    - cto-vp (Executive leadership)
-    - digital-transform (Strategic transformation)
-    - platform-dir (Platform engineering leadership)
-    
-    CRITICAL: 
-    - Do NOT default to "Director" or "Head" roles if the JD is for an Engineer, Senior Engineer, or Architect.
-    - If the role is an Individual Contributor (IC), prefer "cloud-architect", "solution-architect", or "principal-architect".
-    - Only suggest a CUSTOM audience name if NONE of the above IDs fit at all.
-    
-    Return ONLY a JSON array of the IDs. Example: ["microsoft", "cloud-architect"]
-    
-    JOB DESCRIPTION: ${jobDescription}
-    TARGET ROLE: ${targetRole}
-  `;
-
-  const getKeywordFallback = () => {
-    const jd = jobDescription.toLowerCase();
-    const role = targetRole.toLowerCase();
-    const selected: string[] = [];
-
-    if (jd.includes('leadership') || jd.includes('manager') || jd.includes('director') || role.includes('lead') || role.includes('manager')) {
-      selected.push('leadership');
+  const work = async (): Promise<AudienceDecision> => {
+    const routed = routeTask("multi_audience", config);
+    const rules = scoreAudiencesByRules(extractJdSignals(jobDescription, targetRole));
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let decision: AudienceDecision;
+    try {
+      const model = options.fastMode
+        ? routed.engine === "gemini" ? "gemini-3.1-flash-lite" : "gpt-4o-mini"
+        : routed.model;
+      const response = await Promise.race([
+        callAI(buildAudiencePrompt(jobDescription, targetRole), model, routed.engine, routed.apiKey),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("Audience analysis timed out after 20 seconds.")), 20000);
+        }),
+      ]);
+      decision = fuseAudienceDecision(JSON.parse(extractJson(response.result || "")), rules, jobDescription, targetRole);
+    } catch (error) {
+      console.warn("[Audience] AI selection unavailable; using evidence-based rules.", error instanceof Error ? error.name : "AI error");
+      decision = fuseAudienceDecision(null, rules, jobDescription, targetRole);
+      decision.warnings.push("AI analysis was unavailable or timed out. Evidence-based rule suggestions are shown.");
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
-    if (jd.includes('microsoft') || jd.includes('azure')) {
-      selected.push('microsoft');
-    }
-    if (jd.includes('cloud') && (jd.includes('architect') || role.includes('architect'))) {
-      selected.push('cloud-architect');
-    }
-    if (jd.includes('consulting') || jd.includes('client')) {
-      selected.push('consulting');
-    }
-    if (role.includes('director')) {
-      selected.push('director-mid');
-    }
-    if (role.includes('cto') || role.includes('vp')) {
-      selected.push('cto-vp');
-    }
-    if (jd.includes('platform')) {
-      selected.push('platform-dir');
-    }
-    
-    return selected.length > 0 ? selected : [targetRole];
+    rememberAudienceDecision(decision);
+    return decision;
   };
+  const promise = work();
+  audienceInFlight.set(fingerprint, promise);
+  try { return await promise; }
+  finally { if (audienceInFlight.get(fingerprint) === promise) audienceInFlight.delete(fingerprint); }
+}
 
-  try {
-    const data = await callAI(prompt, modelToUse, 'gemini', routedConfig.apiKey);
-    const resultText = extractJson(data.result || "");
-    const parsed = JSON.parse(resultText || '[]');
-    return Array.isArray(parsed) ? parsed : (parsed.audiences || [targetRole]);
-  } catch (error: any) {
-    const errorMsg = error?.message || String(error);
-    const isQuotaError = errorMsg.includes("429") || errorMsg.includes("quota") || errorMsg.includes("limit") || errorMsg.includes("exhausted");
-    
-    if (isQuotaError) {
-      console.warn("Auto-audience selection skipped: Gemini API quota exceeded. Using keyword-based fallback.");
-      return getKeywordFallback();
-    } else {
-      console.error("Error analyzing best audiences:", errorMsg);
-      // Even for other errors, try keyword fallback to provide a better UX than just returning targetRole
-      return getKeywordFallback();
-    }
-  }
+export async function analyzeBestAudiences(
+  jobDescription: string, targetRole: string, config: RouterConfig, fastMode = false
+): Promise<string[]> {
+  const decision = await analyzeAudienceDecision(jobDescription, targetRole, config, { fastMode });
+  return decision.audiences.map((pick) => pick.id);
 }
 
 

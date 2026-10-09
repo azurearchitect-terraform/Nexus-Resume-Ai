@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef, Suspense, lazy } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useDeferredValue, Suspense, lazy } from 'react';
+import { createPortal } from 'react-dom';
 import { Routes, Route, useNavigate, useLocation, Link } from 'react-router-dom';
 import { 
   FileText, 
@@ -62,13 +63,21 @@ import { SortableSection } from './components/SortableSection';
 import { StatusIndicator } from './components/StatusIndicator';
 import { Toast, ConfirmDialog } from './components/UI.tsx';
 import { ResumeHealthScore } from './components/ResumeHealthScore';
+import { BulletRulesSettings } from './components/BulletRulesSettings';
+import { BulletBudgetReportCard } from './components/BulletBudgetReportCard';
+import { LinkedInTrendsCard } from './components/LinkedInTrendsCard';
+import { audienceBrief, audiencesToApply, describeAppliedAudiences, jdFingerprint, selectionMatchesDecision, type AudienceDecision } from './lib/audienceIntelligence';
 import { MODE_DESCRIPTIONS, AUDIENCES, MODEL_PRICING, TARGET_COMPANIES, BACKGROUND_THEMES } from './constants';
 import { downloadDOCX, downloadJSON } from './services/exportService';
+import { canonicalResume, exportBlocks, exportSections, assertUnmaskedExport, atsSafePDFStyle, resumeFileName, sanitizedMetadata } from './lib/atsDocument';
+import { checkAtsCompatibility, plainResumeText, validateExportText } from './lib/exportValidation';
+import { AtsCompatibilityCard } from './components/AtsCompatibilityCard';
+import { AtsResume } from './components/AtsResume';
 import { useResumeStore } from './store';
 import { ResumeData, SuitabilityResult, Certification, MasterResume } from './types';
 import { detectOverflow } from './overflowDetection';
 import { useFormatting, DEFAULT_STYLE } from './context/FormattingContext';
-import { optimizeResume, fetchJobDescription, analyzeBestAudiences, evaluateSuitability, OptimizationResult, EngineType, EngineConfig, autoSelectPlayerCoachRole, selectBestMasterResume, startDeepResearch, getDeepResearchStatus } from './services/geminiService';
+import { optimizeResume, fetchJobDescription, analyzeAudienceDecision, evaluateSuitability, OptimizationResult, EngineType, EngineConfig, autoSelectPlayerCoachRole, selectBestMasterResume, startDeepResearch, getDeepResearchStatus } from './services/geminiService';
 import Markdown from 'react-markdown';
 import { RouterConfig } from './services/aiRouter';
 import { extractTextFromPDFFile } from './lib/pdfUtils';
@@ -102,8 +111,10 @@ import { DriveFolderPicker } from './components/DriveFolderPicker';
 import CorporateProgressLoader from './components/CorporateProgressLoader';
 import { AuthModal } from './components/AuthModal';
 import { TermsModal } from './components/TermsModal';
-import { formatCertification } from './lib/certifications';
 import { describeMatchScore } from './lib/matchScore';
+import { defaultBulletRules, normalizeBulletRules, type BulletRules } from './lib/bulletBudget';
+import { bulletRulesSummary } from './lib/bulletRulesPreview';
+import { curatedTrends } from './lib/linkedinTrends';
 
 import defaultMasterResume from './services/master_resume.json';
 
@@ -121,6 +132,26 @@ const LoadingSpinner = () => (
 );
 
 type OptimizationMode = 'conservative' | 'balanced' | 'aggressive' | 'automatic' | 'Player-Coach';
+
+const BULLET_RULES_STORAGE_KEY = 'nexus_bullet_rules';
+const LINKEDIN_TRENDS_STORAGE_KEY = 'nexus_follow_linkedin_trends';
+
+function loadSavedBulletRules(): BulletRules {
+  try {
+    const saved = localStorage.getItem(BULLET_RULES_STORAGE_KEY);
+    return (saved && normalizeBulletRules(JSON.parse(saved))) || defaultBulletRules();
+  } catch {
+    return defaultBulletRules();
+  }
+}
+
+function loadFollowLinkedInTrends(): boolean {
+  try {
+    return localStorage.getItem(LINKEDIN_TRENDS_STORAGE_KEY) !== 'false';
+  } catch {
+    return true;
+  }
+}
 
 import { CommandPalette } from './components/CommandPalette';
 
@@ -210,6 +241,16 @@ export default function App() {
   const [renamingDriveFileId, setRenamingDriveFileId] = useState<string | null>(null);
   const [newDriveFileName, setNewDriveFileName] = useState('');
   const [customPrompt, setCustomPrompt] = useState('');
+  const [bulletRules, setBulletRules] = useState<BulletRules>(loadSavedBulletRules);
+  const [followLinkedInTrends, setFollowLinkedInTrends] = useState<boolean>(loadFollowLinkedInTrends);
+  useEffect(() => {
+    try {
+      localStorage.setItem(BULLET_RULES_STORAGE_KEY, JSON.stringify(bulletRules));
+      localStorage.setItem(LINKEDIN_TRENDS_STORAGE_KEY, String(followLinkedInTrends));
+    } catch {
+      // Keep the settings active for this session when local storage is unavailable.
+    }
+  }, [bulletRules, followLinkedInTrends]);
   const [isDriveConnected, setIsDriveConnected] = useState(() => {
     return localStorage.getItem('isDriveConnected') === 'true';
   });
@@ -419,7 +460,7 @@ export default function App() {
   useEffect(() => {
     if (isInitialLoad.current) return;
     if (user) setHasUnsavedChanges(true);
-  }, [resumeText, customPrompt, isDriveConnected, versioningEnabled, isAutosaveEnabled, selectedDriveFolder, driveAccessToken, user, masterResumes]);
+  }, [resumeText, customPrompt, bulletRules, followLinkedInTrends, isDriveConnected, versioningEnabled, isAutosaveEnabled, selectedDriveFolder, driveAccessToken, user, masterResumes]);
   const [jobDescription, setJobDescription] = useState('');
   const location = useLocation();
   const navigate = useNavigate();
@@ -430,13 +471,42 @@ export default function App() {
   const [targetRole, setTargetRole] = useState('');
   const [targetCompany, setTargetCompany] = useState('none');
   const [brainDump, setBrainDump] = useState('');
+  const deferredJobDescription = useDeferredValue(jobDescription);
+  const trendPreview = useMemo(
+    () => followLinkedInTrends
+      ? curatedTrends(targetRole || 'Professional Candidate', deferredJobDescription)
+      : null,
+    [followLinkedInTrends, targetRole, deferredJobDescription]
+  );
   const [companyName, setCompanyName] = useState('');
   const [mode, setMode] = useState<OptimizationMode>('balanced');
   const [fastMode, setFastMode] = useState(false);
   const [recruiterSimulationMode, setRecruiterSimulationMode] = useState(false);
   const [selectedAudiences, setSelectedAudiences] = useState<string[]>(['microsoft']);
+  const [autoAudienceEnabled, setAutoAudienceEnabled] = useState(() => localStorage.getItem('nexus_auto_audience') !== 'false');
+  const [audienceDecision, setAudienceDecision] = useState<AudienceDecision | null>(null);
+  const manualAudienceFingerprint = useRef<string | null>(null);
+  const audienceRequest = useRef(0);
+  const audienceInputs = useRef({ jobDescription, targetRole });
+  audienceInputs.current = { jobDescription, targetRole };
+  useEffect(() => {
+    try { localStorage.setItem('nexus_auto_audience', String(autoAudienceEnabled)); }
+    catch (error) { console.warn("Audience preference could not be saved:", error); }
+  }, [autoAudienceEnabled]);
   const [customAudience, setCustomAudience] = useState('');
   const [isAudienceDropdownOpen, setIsAudienceDropdownOpen] = useState(false);
+  const [isAudienceDetailsOpen, setIsAudienceDetailsOpen] = useState(false);
+  const [audiencePopoverPosition, setAudiencePopoverPosition] = useState({ top: 0, left: 0, width: 0, maxHeight: 0 });
+  const audienceControlRef = useRef<HTMLDivElement>(null);
+  const audienceCaretRef = useRef<HTMLButtonElement>(null);
+  const audiencePopoverRef = useRef<HTMLDivElement>(null);
+  const audienceFieldRef = useRef<HTMLButtonElement>(null);
+  const currentAudienceFingerprint = useMemo(() => jdFingerprint(jobDescription, targetRole), [jobDescription, targetRole]);
+  const currentAudienceDecision = audienceDecision?.fingerprint === currentAudienceFingerprint ? audienceDecision : null;
+  const isAutomaticAudienceSelection = selectionMatchesDecision(
+    currentAudienceDecision, selectedAudiences, currentAudienceFingerprint,
+    manualAudienceFingerprint.current === currentAudienceFingerprint,
+  );
   const [isCompanyDropdownOpen, setIsCompanyDropdownOpen] = useState(false);
   const companyDropdownRef = useRef<HTMLDivElement>(null);
   const audienceDropdownRef = useRef<HTMLDivElement>(null);
@@ -511,6 +581,11 @@ export default function App() {
             }
             if (data.customPrompt) {
               setCustomPrompt(data.customPrompt);
+            }
+            const savedBulletRules = normalizeBulletRules(data.bulletRules);
+            if (savedBulletRules) setBulletRules(savedBulletRules);
+            if (typeof data.followLinkedInTrends === 'boolean') {
+              setFollowLinkedInTrends(data.followLinkedInTrends);
             }
             if (data.settings) {
               if (typeof data.settings.versioningEnabled === 'boolean') {
@@ -838,6 +913,8 @@ export default function App() {
         userId: user.uid,
         masterResumes: masterResumes, // Sync array of resumes
         customPrompt: customPrompt || "",
+        bulletRules,
+        followLinkedInTrends,
         settings: {
           versioningEnabled,
           isAutosaveEnabled,
@@ -874,7 +951,7 @@ export default function App() {
     }, 2000); // Sync 2 seconds after last change
 
     return () => clearTimeout(timeoutId);
-  }, [hasUnsavedChanges, user, resumeText, customPrompt, isDriveConnected, versioningEnabled, isAutosaveEnabled, selectedDriveFolder, driveAccessToken, masterResumes]);
+  }, [hasUnsavedChanges, user, resumeText, customPrompt, bulletRules, followLinkedInTrends, isDriveConnected, versioningEnabled, isAutosaveEnabled, selectedDriveFolder, driveAccessToken, masterResumes]);
 
   useEffect(() => {
     const handleBeforeUnload = () => {
@@ -939,6 +1016,8 @@ export default function App() {
         encryptedApiKey: finalEncryptedKey,
         masterResumes: masterResumes,
         customPrompt: customPrompt,
+        bulletRules,
+        followLinkedInTrends,
         settings: {
           versioningEnabled,
           isAutosaveEnabled,
@@ -1000,6 +1079,66 @@ export default function App() {
       document.removeEventListener('mousedown', handleClickOutside);
     };
   }, [isAudienceDropdownOpen]);
+  useLayoutEffect(() => {
+    if (!isAudienceDetailsOpen) return;
+    const reposition = () => {
+      const anchor = audienceControlRef.current?.getBoundingClientRect();
+      if (!anchor) return;
+      const width = Math.min(320, window.innerWidth - 16);
+      const top = Math.min(anchor.bottom + 6, window.innerHeight - 8);
+      setAudiencePopoverPosition({
+        top, left: Math.max(8, Math.min(anchor.right - width, window.innerWidth - width - 8)), width,
+        maxHeight: Math.max(0, Math.min(window.innerHeight * 0.6, window.innerHeight - top - 8)),
+      });
+    };
+    const popover = audiencePopoverRef.current;
+    const isInside = (node: unknown) => node instanceof Node &&
+      (!!audienceControlRef.current?.contains(node) || !!popover?.contains(node));
+    // Outside clicks only close; moving focus here would steal it from the clicked control.
+    const outside = (event: PointerEvent) => {
+      if (!isInside(event.target)) setIsAudienceDetailsOpen(false);
+    };
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setIsAudienceDetailsOpen(false);
+        audienceCaretRef.current?.focus({ preventScroll: true });
+        return;
+      }
+      if (event.key !== 'Tab' || !popover?.contains(document.activeElement)) return;
+      const focusable = Array.from(popover.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), summary, a[href], select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )).filter(el => el.offsetParent !== null);
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || active === popover || !first)) {
+        event.preventDefault();
+        audienceCaretRef.current?.focus({ preventScroll: true });
+      } else if (!event.shiftKey && (active === last || !last)) {
+        event.preventDefault();
+        setIsAudienceDetailsOpen(false);
+        audienceFieldRef.current?.focus({ preventScroll: true });
+      }
+    };
+    const focusout = (event: FocusEvent) => {
+      if (event.relatedTarget && !isInside(event.relatedTarget)) setIsAudienceDetailsOpen(false);
+    };
+    reposition();
+    popover?.focus({ preventScroll: true });
+    document.addEventListener('pointerdown', outside);
+    document.addEventListener('keydown', keydown);
+    popover?.addEventListener('focusout', focusout);
+    window.addEventListener('resize', reposition);
+    window.addEventListener('scroll', reposition, true);
+    return () => {
+      document.removeEventListener('pointerdown', outside);
+      document.removeEventListener('keydown', keydown);
+      popover?.removeEventListener('focusout', focusout);
+      window.removeEventListener('resize', reposition);
+      window.removeEventListener('scroll', reposition, true);
+    };
+  }, [isAudienceDetailsOpen]);
   const { state: formattingState, dispatch: formattingDispatch } = useFormatting();
   const { activeSection, styles: sectionStyles } = formattingState;
   const { 
@@ -1668,6 +1807,8 @@ export default function App() {
 
   const handleDriveAutosave = async () => {
     try {
+      if (isPiiMasked) return;
+      assertUnmaskedExport(isPiiMasked, canonicalBlocks);
       const element = document.getElementById('resume-container');
       if (!element) return;
 
@@ -1687,18 +1828,18 @@ export default function App() {
 
       const role = targetRole || 'Resume';
       const company = companyName ? `-${companyName}` : '';
-      const driveFileName = `${role}${company}-Harnish Jariwala.pdf`;
+      const driveFileName = resumeFileName(canonicalDocument, role, 'pdf', companyName);
       // Keep the company name out of the PDF /Title metadata - see downloadPDF.
-      const pdfTitle = `Harnish Jariwala - ${role}`;
+      const pdfTitle = `${sanitizedMetadata(canonicalDocument.personal_info.name) || 'Candidate'} - Resume`;
 
       const sessionResponse = await fetch('/api/pdf-session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           html: element.outerHTML,
-          css: allStyles + '\n' + scaleCSS,
+          css: allStyles + '\n' + scaleCSS + (previewMode === 'simplified' ? atsSafePDFStyle() : ''),
           title: pdfTitle,
-          scale: printScale,
+          scale: previewMode === 'simplified' ? 1 : printScale,
           fonts: customFonts.map(font => `
             @font-face {
               font-family: '${font.name}';
@@ -1719,6 +1860,9 @@ export default function App() {
       }
       
       const blob = await pdfResponse.blob();
+      const extracted = await extractTextFromPDFFile(new File([blob], driveFileName, { type: 'application/pdf' }));
+      const validation = validateExportText(canonicalBlocks.map(block => block.text).join('\n'), [extracted]);
+      if (validation.errors.length) throw new Error(`PDF text validation failed: ${validation.errors[0]}`);
       const reader = new FileReader();
       reader.readAsDataURL(blob);
       reader.onloadend = async () => {
@@ -2018,22 +2162,31 @@ export default function App() {
     navigate('/build');
   };
 
-  const handleAutoSelectAudiences = async () => {
-    if (!jobDescription) return;
+  const handleAutoSelectAudiences = async (force = true, autoApply = true, explicit = false) => {
+    if (!jobDescription.trim()) return;
+    const request = ++audienceRequest.current;
+    const fingerprint = jdFingerprint(jobDescription, targetRole);
     setIsAutoSelectingAudiences(true);
     try {
-      const bestAudiences = await analyzeBestAudiences(jobDescription, targetRole, getRouterConfig());
-      setSelectedAudiences(bestAudiences);
-      showToast('Audience auto-selected!', 'success');
+      const decision = await analyzeAudienceDecision(jobDescription, targetRole, getRouterConfig(), { fastMode, force });
+      if (request !== audienceRequest.current ||
+        fingerprint !== jdFingerprint(audienceInputs.current.jobDescription, audienceInputs.current.targetRole)) return;
+      setAudienceDecision(decision);
+      if (autoApply && (explicit || manualAudienceFingerprint.current !== fingerprint)) {
+        if (explicit) manualAudienceFingerprint.current = null;
+        setSelectedAudiences(audiencesToApply(decision));
+        if (explicit) showToast(describeAppliedAudiences(decision), 'success');
+      }
     } catch (e) {
       console.error(e);
       showToast('Failed to auto-select audience', 'error');
     } finally {
-      setIsAutoSelectingAudiences(false);
+      if (request === audienceRequest.current) setIsAutoSelectingAudiences(false);
     }
   };
 
   const toggleAudience = (id: string) => {
+    manualAudienceFingerprint.current = jdFingerprint(jobDescription, targetRole);
     setSelectedAudiences(prev => 
       prev.includes(id) ? prev.filter(a => a !== id) : [...prev, id]
     );
@@ -2054,6 +2207,25 @@ export default function App() {
       }
     };
   };
+
+  useEffect(() => {
+    setAudienceDecision(null);
+    const fingerprint = jdFingerprint(jobDescription, targetRole);
+    if (!autoAudienceEnabled || jobDescription.trim().length < 200) {
+      audienceRequest.current++;
+      setIsAutoSelectingAudiences(false);
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (fingerprint === jdFingerprint(audienceInputs.current.jobDescription, audienceInputs.current.targetRole)) {
+        void handleAutoSelectAudiences(false, true);
+      }
+    }, 1500);
+    return () => {
+      clearTimeout(timer);
+      audienceRequest.current++;
+    };
+  }, [jobDescription, targetRole, autoAudienceEnabled]);
 
   const handleFetchJobDescription = async () => {
     if (!jobUrl) {
@@ -2245,6 +2417,8 @@ export default function App() {
       return;
     }
 
+    let optimizationJobDescription = jobDescription;
+    let optimizationAudienceDecision = audienceDecision;
     let currentAudiences = [...selectedAudiences];
     console.log("[Nexus AI] Current Audiences:", currentAudiences);
 
@@ -2253,7 +2427,15 @@ export default function App() {
       setIsOptimizing(true);
       
       try {
-        const bestAudiences = await analyzeBestAudiences(jobDescription || jobUrl || "", targetRole || "Professional Candidate", getRouterConfig(), fastMode);
+        const posting = jobDescription || await fetchJobDescription(jobUrl, getRouterConfig());
+        optimizationJobDescription = posting;
+        if (!jobDescription) setJobDescription(posting);
+        const decision = audienceDecision?.fingerprint === jdFingerprint(posting, targetRole)
+          ? audienceDecision
+          : await analyzeAudienceDecision(posting, targetRole, getRouterConfig(), { fastMode });
+        setAudienceDecision(decision);
+        optimizationAudienceDecision = decision;
+        const bestAudiences = audiencesToApply(decision);
         console.log("[Nexus AI] Best Audiences matched:", bestAudiences);
         if (bestAudiences && bestAudiences.length > 0) {
           setSelectedAudiences(bestAudiences);
@@ -2313,10 +2495,14 @@ export default function App() {
     let finalResumeText = overrideResumeText || resumeText || "";
 
     try {
+      if (!optimizationJobDescription && jobUrl) {
+        optimizationJobDescription = await fetchJobDescription(jobUrl, getRouterConfig());
+        setJobDescription(optimizationJobDescription);
+      }
       const finalTargetRole = targetRole || "Professional Candidate";
       let finalMode = mode;
       try {
-        const isPC = await autoSelectPlayerCoachRole(jobDescription, getRouterConfig());                
+        const isPC = await autoSelectPlayerCoachRole(optimizationJobDescription, getRouterConfig());
         if (isPC) {
           console.log("[Nexus AI] Auto-detected Player-Coach role based on JD.");
           finalMode = 'Player-Coach';
@@ -2356,7 +2542,7 @@ export default function App() {
         
         const data = await optimizeResume(
           finalResumeText, 
-          jobDescription, 
+          optimizationJobDescription,
           finalTargetRole, 
           finalMode, 
           audienceLabel, 
@@ -2370,7 +2556,14 @@ export default function App() {
           selectedEngine.includes('hybrid') ? selectedEngine : undefined,
           targetCompany,
           brainDump,
-          companyName
+          {
+            bulletRules, linkedinTrends: followLinkedInTrends,
+            audienceBrief: audienceBrief(
+              optimizationAudienceDecision?.fingerprint === jdFingerprint(optimizationJobDescription, targetRole) ? optimizationAudienceDecision : null,
+              audienceId
+            ),
+            companyName,
+          }
         );
         
         completedAudiences++;
@@ -2539,43 +2732,12 @@ export default function App() {
   };
 
   const copyResumeText = () => {
-    if (!activeAudience || !results[activeAudience]) return;
-    const res = results[activeAudience];
-    
-    const skillsText = Array.isArray(res.skills) 
-      ? res.skills.join(', ') 
-      : Object.entries(res.skills).map(([cat, items]) => `${cat.toUpperCase()}: ${(items as string[]).join(', ')}`).join('\n');
-
-    const projectsText = res.projects?.map(p => typeof p === 'string' ? p : `${p.title}: ${p.description}`).join('\n');
-
-    const text = `
-${profileName}
-${profileLocation} | ${profileEmail} | ${profilePhone}
-
-PROFESSIONAL SUMMARY
-${res.summary}
-
-SKILLS
-${skillsText}
-
-PROFESSIONAL EXPERIENCE
-${res.experience.map(exp => `
-${exp.role} | ${exp.duration}
-${exp.company}
-${exp.bullets.join('\n')}
-`).join('\n')}
-
-${projectsText ? `PROJECTS\n${projectsText}\n` : ''}
-
-CERTIFICATIONS
-${(res.certifications || [] as (Certification | string)[]).map(formatCertification).join('\n')}
-
-EDUCATION
-${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${edu.degree} - ${edu.institution} (Expected : ${edu.expected_completion})`).join('\n')}
-    `.trim();
-    
-    navigator.clipboard.writeText(text);
-    showToast('Resume text copied to clipboard! You can paste this into Word or any other editor.', 'success');
+    if (isPiiMasked) {
+      showToast('Turn off PII masking before copying resume text.', 'error');
+      return;
+    }
+    navigator.clipboard.writeText(plainResumeText(canonicalDocument));
+    showToast('Resume text copied to clipboard!', 'success');
   };
 
   const leftPanelRef = useRef<HTMLDivElement>(null);
@@ -2722,7 +2884,30 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
     }
   };
 
+  const canonicalDocument = useMemo(() => canonicalResume(results[activeAudience!] || data, {
+    name: profileName, location: profileLocation, email: profileEmail, phone: profilePhone, linkedin: profileLinkedIn,
+  }, data), [results, activeAudience, data, profileName, profileLocation, profileEmail, profilePhone, profileLinkedIn]);
+  const canonicalBlocks = useMemo(() => exportBlocks(canonicalDocument), [canonicalDocument]);
+  const compatibilityIssues = useMemo(() => {
+    const issues = checkAtsCompatibility(canonicalDocument, canonicalBlocks, { masked: isPiiMasked });
+    if (previewMode === 'standard') {
+      for (const section of ['header', 'summary', 'skills', 'experience', 'projects', 'certifications', 'education']) {
+        const style = getSectionStyle(section);
+        issues.push(...checkAtsCompatibility(canonicalDocument, [], {
+          font: style.fontFamily, sizePt: style.fontSize, scale: printScale,
+        }).filter(issue => /font|body text/i.test(issue.message)));
+      }
+    }
+    return issues.filter((issue, index, all) => all.findIndex(other => other.message === issue.message) === index);
+  }, [canonicalDocument, canonicalBlocks, isPiiMasked, previewMode, getSectionStyle, printScale]);
+
   const downloadPDF = async () => {
+    try {
+      assertUnmaskedExport(isPiiMasked, canonicalBlocks);
+    } catch (error) {
+      showToast((error as Error).message, 'error');
+      return;
+    }
     const element = document.getElementById('resume-container');
     if (!element) return;
 
@@ -2794,15 +2979,15 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
 
       const role = targetRole || 'Resume';
       const companyStr = companyName ? `-${companyName}` : '';
-      const driveFileName = `${role}${companyStr}-Harnish Jariwala.pdf`;
-      const downloadFileName = `${role}-Harnish Jariwala.pdf`;
+      const driveFileName = resumeFileName(canonicalDocument, role, 'pdf', companyName);
+      const downloadFileName = resumeFileName(canonicalDocument, role, 'pdf');
       // The company name is deliberately kept OUT of the PDF's Title metadata.
       // Chrome writes document.title into the PDF /Title field, which every reader
       // shows in its title bar and document properties. Embedding the target
       // company there means a recruiter at the next company opens the file and
       // sees it was tailored for a competitor. The company still goes in the
       // Google Drive filename, which is private to the user.
-      const pdfTitle = `Harnish Jariwala - ${role}`;
+      const pdfTitle = `${sanitizedMetadata(canonicalDocument.personal_info.name) || 'Candidate'} - Resume`;
 
       const sessionResponse = await fetch('/api/pdf-session', {
         method: 'POST',
@@ -2811,9 +2996,9 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
         },
         body: JSON.stringify({
           html: targetOuterHTML,
-          css: allStyles + '\n' + scaleCSS,
+          css: allStyles + '\n' + scaleCSS + (previewMode === 'simplified' ? atsSafePDFStyle() : ''),
           title: pdfTitle,
-          scale: printScale,
+          scale: previewMode === 'simplified' ? 1 : printScale,
           fonts: customFonts.map(font => `
             @font-face {
               font-family: '${font.name}';
@@ -2849,6 +3034,12 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
       }
       
       const blob = await pdfResponse.blob();
+      const extracted = await extractTextFromPDFFile(new File([blob], downloadFileName, { type: 'application/pdf' }));
+      const validation = validateExportText(canonicalBlocks.map(block => block.text).join('\n'), [extracted]);
+      if (validation.errors.length) throw new Error(`PDF text validation failed: ${validation.errors[0]}`);
+      const pageCount = Number(pdfResponse.headers.get('X-Resume-Page-Count'));
+      if (pageCount > 2) showToast(`This PDF is ${pageCount} pages. All content is preserved; adjust layout or content rather than shrinking below readable text sizes.`, 'info');
+      if (blob.size > 2.5 * 1024 * 1024) showToast('This PDF is over 2.5 MB. Large files may not parse reliably in some applicant tracking systems; check the employer’s upload requirements.', 'info');
 
       // Convert blob to base64 for Drive saving
       const reader = new FileReader();
@@ -2917,8 +3108,13 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
   };
 
   const handleDownloadDOCX = async () => {
-    const res = results[activeAudience!] || data;
-    await downloadDOCX(res, targetRole, companyName, showToast);
+    try {
+      assertUnmaskedExport(isPiiMasked, canonicalBlocks);
+    } catch (error) {
+      showToast((error as Error).message, 'error');
+      return;
+    }
+    await downloadDOCX(canonicalDocument, targetRole, companyName, showToast, canonicalBlocks, isPiiMasked);
     
     // Sync to Job Tracker as Applied
     syncJobTrackerApplied();
@@ -2948,382 +3144,23 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
   };
 
   const renderSimplifiedResume = () => {
-    const res = results[activeAudience!] || data;
-    if (!res) return null;
-
-    return (
-      <div className="bg-white text-black leading-tight max-w-[210mm] min-w-[210mm] min-h-[297mm] mx-auto shadow-sm" style={{ padding: '25mm', fontFamily: '"Calibri", "Open Sans", sans-serif' }}>
-        {/* Header */}
-        <div className="text-center mb-5 border-b border-black pb-2">
-          <h1 className="font-bold uppercase mb-0.5 tracking-[0.1em]" style={{ fontSize: '18pt' }}>{res.personal_info?.name || ''}</h1>
-          <p className="font-medium tracking-wide" style={{ fontSize: '10.5pt' }}>
-            {res.personal_info?.location || ''} | {res.personal_info?.email || ''} | {res.personal_info?.phone || ''} | {res.personal_info?.linkedin || ''}
-          </p>
-        </div>
-
-        {/* Summary */}
-        <div className="mb-4">
-          <h2 className="font-bold border-b border-black mb-1 uppercase tracking-[0.05em]" style={{ fontSize: '13pt' }}>Summary</h2>
-          <p className="leading-normal text-justify" style={{ fontSize: '10.5pt' }}>{(res as any).summary || (res as any).personal_info?.summary || ""}</p>
-        </div>
-
-        {/* Skills */}
-        <div className="mb-4">
-          <h2 className="font-bold border-b border-black mb-1 uppercase tracking-[0.05em]" style={{ fontSize: '13pt' }}>Skills</h2>
-          <div className="leading-normal" style={{ fontSize: '10.5pt' }}>
-            {Array.isArray(res.skills) 
-              ? res.skills.join(", ") 
-              : Object.entries(res.skills).map(([cat, skills]) => (
-                  <div key={cat} className="flex">
-                    <span className="font-bold mr-2">{cat}:</span>
-                    <span>{(skills as string[]).join(", ")}</span>
-                  </div>
-                ))}
-          </div>
-        </div>
-
-        {/* Experience */}
-        <div className="mb-4">
-          <h2 className="font-bold border-b border-black mb-1 uppercase tracking-[0.05em]" style={{ fontSize: '13pt' }}>Experience</h2>
-          {Array.isArray(res.experience) && res.experience.map((exp: any, i: number) => (
-            <div key={i} className="mb-3">
-              <div className="flex justify-between font-bold" style={{ fontSize: '11.5pt' }}>
-                <span>{exp.role}</span>
-                <span className="font-medium">{exp.duration}</span>
-              </div>
-              <div className="font-bold mb-0.5" style={{ fontSize: '11pt' }}>{exp.company}</div>
-              <div className="space-y-0.5">
-                {Array.isArray(exp.bullets) && exp.bullets.map((bullet: string, bi: number) => (
-                  <div key={bi} className="flex gap-2">
-                    <span className="shrink-0 text-[10.5pt]">•</span>
-                    <span className="leading-normal" style={{ fontSize: '10.5pt' }}>{bullet}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
-
-        {/* Projects */}
-        {Array.isArray(res.projects) && res.projects.length > 0 && (
-          <div className="mb-3">
-            <h2 className="font-bold border-b border-black/10 mb-1 uppercase tracking-[0.05em]" style={{ fontSize: '13pt' }}>Projects</h2>
-            {res.projects.map((proj: any, i: number) => (
-              <div key={i} className="mb-1.5">
-                <div className="font-bold" style={{ fontSize: '11.5' }}>{typeof proj === 'string' ? proj : proj.title}</div>
-                {typeof proj !== 'string' && proj.description && (
-                  <div className="flex gap-2">
-                    <span className="shrink-0 text-[10.5pt]">•</span>
-                    <span className="leading-normal" style={{ fontSize: '10.5pt' }}>{proj.description}</span>
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Certifications */}
-        {Array.isArray(res.certifications) && res.certifications.length > 0 && (
-          <div className="mb-3">
-            <h2 className="font-bold border-b border-black/10 mb-1 uppercase tracking-[0.05em]" style={{ fontSize: '13pt' }}>Certifications</h2>
-            <div className="space-y-0.5">
-              {res.certifications.map((cert: any, i: number) => (
-                <div key={i} className="text-[10.5pt]">
-                  • {formatCertification(cert)}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Education */}
-        {Array.isArray(res.education) && res.education.length > 0 && (
-          <div className="mb-3">
-            <h2 className="font-bold border-b border-black/10 mb-1 uppercase tracking-[0.05em]" style={{ fontSize: '13pt' }}>Education</h2>
-            <div className="space-y-0.5">
-              {res.education.map((edu: any, i: number) => (
-                <div key={i} className="text-[10.5pt] font-medium">
-                  • {typeof edu === 'string' ? edu : `${edu.degree} - ${edu.institution} (Expected : ${edu.expected_completion})`}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-    );
+    return <AtsResume blocks={canonicalBlocks} masked={isPiiMasked} />;
   };
 
-  const renderSection = (sectionId: string, customExp?: any[], isContinuation?: boolean) => {
-    switch (sectionId) {
-      case 'header':
-        const personalInfo = {
-          ...(results[activeAudience!]?.personal_info as any || {}),
-          name: profileName || results[activeAudience!]?.personal_info?.name || data.personal_info?.name || '',
-          location: isPiiMasked ? '[REDACTED LOCATION]' : (profileLocation || results[activeAudience!]?.personal_info?.location || data.personal_info?.location || ''),
-          email: isPiiMasked ? '[REDACTED EMAIL]' : (profileEmail || results[activeAudience!]?.personal_info?.email || data.personal_info?.email || ''),
-          phone: isPiiMasked ? '[REDACTED PHONE]' : (profilePhone || results[activeAudience!]?.personal_info?.phone || data.personal_info?.phone || ''),
-          linkedin: profileLinkedIn || results[activeAudience!]?.personal_info?.linkedin || data.personal_info?.linkedin || '',
-          linkedinText: profileLinkedInText || results[activeAudience!]?.personal_info?.linkedinText || '',
-          summary: results[activeAudience!]?.summary || data.personal_info?.summary || ''
-        } as any;
-        return (
-          <div 
-            key="header"
-            onClick={() => formattingDispatch({ type: 'SET_ACTIVE_SECTION', sectionId: 'header' })}
-            className={`cursor-pointer transition-all rounded p-2 mb-2 resume-section ${activeSection === 'header' ? 'bg-emerald-50/50 outline-dashed outline-1 outline-emerald-500/30' : 'hover:bg-black/5'}`}
-            style={{ 
-              fontFamily: getSectionStyle('header').fontFamily, 
-              textAlign: 'center',
-              lineHeight: getSectionStyle('header').lineHeight,
-              color: getSectionStyle('header').color,
-              letterSpacing: `${getSectionStyle('header').letterSpacing}em`,
-              padding: `${getSectionStyle('header').padding}px`,
-              marginBottom: `${getSectionStyle('header').margin}px`,
-            }}
-          >
-            <h1 className="font-bold uppercase tracking-[0.1em] mb-1" style={{ fontSize: '18pt' }}>
-              {personalInfo.name}
-            </h1>
-            <div className="font-medium border-t border-black/10 pt-2 flex justify-center items-center gap-x-4 gap-y-1 flex-wrap" style={{ fontSize: '10.5pt', lineHeight: '1.2' }}>
-              <span className="whitespace-nowrap">{personalInfo.location}</span>
-              <span className="opacity-30"></span>
-              <span className="whitespace-nowrap">{personalInfo.email}</span>
-              <span className="opacity-30"></span>
-              <span className="whitespace-nowrap">{personalInfo.phone}</span>
-              {personalInfo.linkedin && (
-                <>
-                  <span className="opacity-30"></span>
-                  <span className="whitespace-nowrap">LinkedIn: {personalInfo.linkedinText || personalInfo.linkedin.replace(/^https?:\/\/(www\.)?linkedin\.com\/in\//, '').replace(/\/$/, '')}</span>
-                </>
-              )}
-            </div>
-          </div>
-        );
-      case 'summary':
-        return (
-          <div 
-            key="summary"
-            onClick={() => formattingDispatch({ type: 'SET_ACTIVE_SECTION', sectionId: 'summary' })}
-            className={`mb-2 cursor-pointer transition-all rounded p-2 resume-section ${activeSection === 'summary' ? 'bg-emerald-50/50 outline-dashed outline-1 outline-emerald-500/30' : 'hover:bg-black/5'}`}
-            style={{ 
-              fontFamily: getSectionStyle('summary').fontFamily, 
-              textAlign: 'justify',
-              lineHeight: getSectionStyle('summary').lineHeight,
-              color: getSectionStyle('summary').color,
-              letterSpacing: `${getSectionStyle('summary').letterSpacing}em`,
-              padding: `${getSectionStyle('summary').padding}px`,
-              marginBottom: `${getSectionStyle('summary').margin}px`,
-              fontSize: `${getSectionStyle('summary').fontSize}px`,
-            }}
-          >
-            <h2 className="font-bold mb-1 uppercase tracking-[0.05em] border-b border-black/10 pb-0.5" style={{ fontSize: '13pt' }}>
-              Summary
-            </h2>
-            <p className="leading-normal" style={{ fontSize: '10.5pt' }}>{results[activeAudience!]?.summary || data.personal_info.summary}</p>
-          </div>
-        );
-      case 'skills':
-        return (
-          <div 
-            key="skills"
-            onClick={() => formattingDispatch({ type: 'SET_ACTIVE_SECTION', sectionId: 'skills' })}
-            className={`mb-2 cursor-pointer transition-all rounded p-2 resume-section ${activeSection === 'skills' ? 'bg-emerald-50/50 outline-dashed outline-1 outline-emerald-500/30' : 'hover:bg-black/5'}`}
-            style={{ 
-              fontFamily: getSectionStyle('skills').fontFamily, 
-              lineHeight: getSectionStyle('skills').lineHeight,
-              color: getSectionStyle('skills').color,
-              letterSpacing: `${getSectionStyle('skills').letterSpacing}em`,
-              padding: `${Math.max(4, getSectionStyle('skills').padding / 2)}px`,
-              marginBottom: `${Math.max(4, getSectionStyle('skills').margin / 2)}px`,
-              fontSize: `${getSectionStyle('skills').fontSize}px`,
-            }}
-          >
-            <h2 className="font-bold mb-1 uppercase tracking-[0.05em] border-b border-black/10 pb-0.5" style={{ fontSize: '13pt' }}>
-              Skills
-            </h2>
-            {results[activeAudience!]?.skills && !Array.isArray(results[activeAudience!].skills) ? (
-              <div className="grid grid-cols-1 gap-y-1">
-                {Object.entries(results[activeAudience!].skills).map(([category, items]) => (
-                  <div key={category} className="grid grid-cols-[190px_1fr] gap-2 text-[10.5pt] leading-tight">
-                    <span className="font-bold">{category}:</span>
-                    <span className="">{(items as unknown as string[]).join(', ')}</span>
-                  </div>
-                ))}
-              </div>
-            ) : typeof data.skills === 'object' && !Array.isArray(data.skills) ? (
-              <div className="grid grid-cols-1 gap-y-1">
-                {Object.entries(data.skills as any).map(([category, items]) => (
-                  <div key={category} className="grid grid-cols-[190px_1fr] gap-2 text-[10.5pt] leading-tight">
-                    <span className="font-bold">{category}:</span>
-                    <span className="">{(items as unknown as string[]).join(', ')}</span>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="text-[10.5pt] leading-normal">
-                {((
-                  activeAudience && results[activeAudience]?.skills 
-                    ? (Array.isArray(results[activeAudience].skills) 
-                        ? results[activeAudience].skills 
-                        : Object.values(results[activeAudience].skills).flat())
-                    : data.skills
-                ) as string[]).join(', ')}
-              </div>
-            )}
-          </div>
-        );
-      case 'certifications':
-        return (
-          <div 
-            key="certifications"
-            onClick={() => formattingDispatch({ type: 'SET_ACTIVE_SECTION', sectionId: 'certifications' })}
-            className={`mb-2 cursor-pointer transition-all rounded p-2 resume-section ${activeSection === 'certifications' ? 'bg-emerald-50/50 outline-dashed outline-1 outline-emerald-500/30' : 'hover:bg-black/5'}`}
-            style={{ 
-              fontFamily: getSectionStyle('certifications').fontFamily, 
-              lineHeight: getSectionStyle('certifications').lineHeight,
-              color: getSectionStyle('certifications').color,
-              letterSpacing: `${getSectionStyle('certifications').letterSpacing}em`,
-              padding: `${getSectionStyle('certifications').padding}px`,
-              marginBottom: `${getSectionStyle('certifications').margin}px`,
-              fontSize: `${getSectionStyle('certifications').fontSize}px`,
-            }}
-          >
-            <h2 className="font-bold mb-1 uppercase tracking-[0.05em] border-b border-black/10 pb-0.5" style={{ fontSize: '13pt' }}>
-              Certifications
-            </h2>
-            <div className="grid grid-cols-1 gap-0.5">
-              {(results[activeAudience!]?.certifications || data.certifications || []).map((cert: any, i) => (
-                <div key={i} className="text-[10.5pt]">
-                  • {formatCertification(cert)}
-                </div>
-              ))}
-            </div>
-          </div>
-        );
-      case 'experience':
-        const allExp = customExp || results[activeAudience!]?.experience || data.experience;
-        if (!Array.isArray(allExp) || allExp.length === 0) return null;
-        return (
-          <div 
-            key={isContinuation ? "experience-split-2" : "experience"}
-            onClick={() => formattingDispatch({ type: 'SET_ACTIVE_SECTION', sectionId: 'experience' })}
-            className={`cursor-pointer transition-all rounded p-2 mb-2 resume-section ${activeSection === 'experience' ? 'bg-emerald-50/50 outline-dashed outline-1 outline-emerald-500/30' : 'hover:bg-black/5'}`}
-            style={{ 
-              fontFamily: getSectionStyle('experience').fontFamily, 
-              lineHeight: getSectionStyle('experience').lineHeight,
-              color: getSectionStyle('experience').color,
-              letterSpacing: `${getSectionStyle('experience').letterSpacing}em`,
-              padding: `${getSectionStyle('experience').padding}px`,
-              marginBottom: `${getSectionStyle('experience').margin}px`,
-              fontSize: `${getSectionStyle('experience').fontSize}px`,
-            }}
-          >
-            {!isContinuation && (
-              <h2 className="font-bold mb-1 uppercase tracking-[0.05em] border-b border-black/10 pb-0.5" style={{ fontSize: '13pt' }}>
-                Experience
-              </h2>
-            )}
-            {allExp.map((exp: any, i: number) => (
-              <div key={i} className="experience-item mb-2 last:mb-0">
-                <div className="flex justify-between font-bold items-baseline mb-0">
-                  <span style={{ fontSize: '11.5pt' }}>{exp.role}</span>
-                  <span className="font-medium" style={{ fontSize: '11pt' }}>{exp.duration}</span>
-                </div>
-                <div className="font-bold mb-1" style={{ fontSize: '11.5pt' }}>{exp.company}</div>
-                <ul className="space-y-0.5 list-none p-0 m-0">
-                  {Array.isArray(exp.bullets) && exp.bullets.map((b: string, bi: number) => (
-                    <li key={bi} className="flex gap-2">
-                      <span className="shrink-0">•</span>
-                      <span className="leading-normal" style={{ fontSize: '10.5pt' }}>{b}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ))}
-          </div>
-        );
-      case 'projects':
-        const allProjects = (Array.isArray(results[activeAudience!]?.projects) && results[activeAudience!]?.projects.length > 0) 
-          ? results[activeAudience!]?.projects 
-          : data.projects;
-        if (!Array.isArray(allProjects) || allProjects.length === 0) return null;
-        return (
-          <div 
-            key="projects"
-            onClick={() => formattingDispatch({ type: 'SET_ACTIVE_SECTION', sectionId: 'projects' })}
-            className={`mb-2 cursor-pointer transition-all rounded p-2 resume-section ${activeSection === 'projects' ? 'bg-emerald-50/50 outline-dashed outline-1 outline-emerald-500/30' : 'hover:bg-black/5'}`}
-            style={{ 
-              fontFamily: getSectionStyle('projects').fontFamily, 
-              lineHeight: getSectionStyle('projects').lineHeight,
-              color: getSectionStyle('projects').color,
-              letterSpacing: `${getSectionStyle('projects').letterSpacing}em`,
-              padding: `${getSectionStyle('projects').padding}px`,
-              marginBottom: `${getSectionStyle('projects').margin}px`,
-              fontSize: `${getSectionStyle('projects').fontSize}px`,
-            }}
-          >
-            <h2 className="font-bold mb-1 uppercase tracking-[0.05em] border-b border-black/10 pb-0.5" style={{ fontSize: '13pt' }}>
-              Projects
-            </h2>
-            <div className="space-y-1.5">
-              {allProjects.map((proj: any, i: number) => (
-                <div key={i} className="project-item mb-1 last:mb-0">
-                  <div className="font-bold mb-0" style={{ fontSize: '11.5pt' }}>
-                    {typeof proj === 'string' ? proj : (proj as any).title}
-                  </div>
-                  {typeof proj !== 'string' && (proj as any).description && (
-                    <div className="flex gap-2">
-                      <span className="shrink-0">•</span>
-                      <span className="leading-normal" style={{ fontSize: '10.5pt' }}>
-                        {(proj as any).description}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-        );
-      case 'education':
-        const allEdu = (Array.isArray(results[activeAudience!]?.education) && results[activeAudience!]?.education.length > 0) 
-          ? results[activeAudience!]?.education 
-          : data.education || [];
-        if (!Array.isArray(allEdu) || allEdu.length === 0) return null;
-        return (
-          <div 
-            key="education"
-            onClick={() => formattingDispatch({ type: 'SET_ACTIVE_SECTION', sectionId: 'education' })}
-            className={`mb-2 cursor-pointer transition-all rounded p-2 resume-section ${activeSection === 'education' ? 'bg-emerald-50/50 outline-dashed outline-1 outline-emerald-500/30' : 'hover:bg-black/5'}`}
-            style={{ 
-              fontFamily: getSectionStyle('education').fontFamily, 
-              lineHeight: getSectionStyle('education').lineHeight,
-              color: getSectionStyle('education').color,
-              letterSpacing: `${getSectionStyle('education').letterSpacing}em`,
-              padding: `${getSectionStyle('education').padding}px`,
-              marginBottom: `${getSectionStyle('education').margin}px`,
-              fontSize: `${getSectionStyle('education').fontSize}px`,
-            }}
-          >
-            <h2 className="font-bold mb-1 uppercase tracking-[0.05em] border-b border-black/10 pb-0.5" style={{ fontSize: '13pt' }}>
-              Education
-            </h2>
-            {allEdu.map((edu: any, i: number) => (
-              <div key={i} className="mb-0.5 last:mb-0" style={{ pageBreakInside: 'avoid' }}>
-                <div className="text-[10.5pt] font-medium">
-                  • {typeof edu === 'string' 
-                    ? edu 
-                    : (edu.degree || edu.institution)
-                      ? `${edu.degree || 'Degree'} - ${edu.institution || 'Institution'}${edu.expected_completion ? ` (Expected : ${edu.expected_completion})` : ''}`
-                      : JSON.stringify(edu)
-                  }
-                </div>
-              </div>
-            ))}
-          </div>
-        );
-      default:
-        return null;
+  const renderSection = (sectionId: string) => {
+    const blocks = canonicalBlocks.filter(block => block.section === sectionId);
+    if (blocks.length) {
+      return <AtsResume key={sectionId} blocks={blocks} masked={isPiiMasked} sectionOnly activeSection={activeSection}
+        onSection={id => formattingDispatch({ type: 'SET_ACTIVE_SECTION', sectionId: id })}
+        sectionStyle={id => {
+          const style = getSectionStyle(id);
+          return { fontFamily: style.fontFamily, fontSize: `${style.fontSize}pt`, lineHeight: style.lineHeight,
+            color: style.color, letterSpacing: `${style.letterSpacing}em`,
+            padding: `${style.padding}px`, marginBottom: `${style.margin}px` };
+        }}
+      />;
     }
+    return null;
   };
 
   if (showAdminDashboard) {
@@ -3737,21 +3574,117 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                               );
                             })()}
                             <div className="relative" ref={audienceDropdownRef}>
-                              <div className="flex items-center justify-between mb-2">
-                                <label className={`text-[10px] font-bold uppercase tracking-widest ${isDarkMode ? 'text-white/70' : 'text-slate-800'}`}>Target Audiences (Multi-select)</label>
-                                <button 
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleAutoSelectAudiences();
-                                  }}
-                                  disabled={isAutoSelectingAudiences}
-                                  className="py-1 px-2 text-[10px] font-bold uppercase tracking-widest bg-emerald-500/10 text-emerald-500 rounded hover:bg-emerald-500/20 transition-colors disabled:opacity-50"
-                                >
-                                  {isAutoSelectingAudiences ? 'Selecting...' : 'Auto-Select'}
-                                </button>
+                              <div className="flex items-center justify-between gap-2 mb-2">
+                                <label className={`text-xs font-bold uppercase tracking-wide ${isDarkMode ? 'text-white/70' : 'text-slate-800'}`}>Target Audiences (Multi-select)</label>
+                                <div ref={audienceControlRef} className="flex shrink-0 rounded bg-emerald-500/10">
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleAutoSelectAudiences(true, true, true)}
+                                    disabled={isAutoSelectingAudiences || !jobDescription.trim()}
+                                    title={!jobDescription.trim() ? 'Paste a job description to use Auto-Select.' : 'Re-analyze the JD and apply the best audiences.'}
+                                    className={`flex items-center gap-1 py-1 px-2 text-xs font-semibold rounded-l hover:bg-emerald-500/20 disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-500 ${isDarkMode ? 'text-emerald-400' : 'text-emerald-700'}`}
+                                  >
+                                    {isAutoSelectingAudiences && <Loader2 className="h-3 w-3 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
+                                    {isAutoSelectingAudiences ? 'Analyzing…' : 'Auto-Select'}
+                                  </button>
+                                  <button
+                                    ref={audienceCaretRef}
+                                    type="button"
+                                    aria-label="Auto-Select details"
+                                    aria-expanded={isAudienceDetailsOpen}
+                                    aria-controls="audience-auto-select-details"
+                                    onClick={() => {
+                                      setIsAudienceDropdownOpen(false);
+                                      setIsAudienceDetailsOpen(open => !open);
+                                    }}
+                                    className={`px-1 border-l border-emerald-500/20 rounded-r hover:bg-emerald-500/20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-500 ${isDarkMode ? 'text-emerald-400' : 'text-emerald-700'}`}
+                                  >
+                                    <ChevronDown className="h-3 w-3" aria-hidden="true" />
+                                  </button>
+                                </div>
                               </div>
+                              {isAudienceDetailsOpen && createPortal(
+                                <div
+                                  id="audience-auto-select-details"
+                                  ref={audiencePopoverRef}
+                                  role="dialog"
+                                  aria-label="Auto-Select details"
+                                  tabIndex={-1}
+                                  style={audiencePopoverPosition}
+                                  className={`fixed z-50 overflow-y-auto rounded-xl border p-3 text-xs shadow-xl space-y-3 ${isDarkMode ? 'bg-neutral-950 border-white/20 text-white' : 'bg-white border-slate-200 text-slate-900'}`}
+                                >
+                                  {currentAudienceDecision ? (
+                                    <>
+                                      <div className="flex flex-wrap items-center gap-1">
+                                        <span className={`rounded px-2 py-1 font-semibold ${isDarkMode ? 'bg-emerald-500/15 text-emerald-300' : 'bg-emerald-50 text-emerald-800'}`}>
+                                          {currentAudienceDecision.source === 'rules' ? 'Rules fallback' : 'AI'}
+                                        </span>
+                                        {[currentAudienceDecision.signals.seniority.value, currentAudienceDecision.signals.peopleManagement.value,
+                                          ...currentAudienceDecision.signals.platforms, currentAudienceDecision.signals.orgScale.value]
+                                          .filter(value => value !== 'not stated').slice(0, 4).map(value => (
+                                            <span key={value} className={`rounded px-2 py-1 ${isDarkMode ? 'bg-white/10' : 'bg-slate-100'}`}>{value}</span>
+                                          ))}
+                                      </div>
+                                      <ol className="space-y-2">
+                                        {currentAudienceDecision.audiences.map(pick => (
+                                          <li key={pick.id}>
+                                            <div className="flex items-center gap-2" title={pick.reason}>
+                                              <span className="min-w-0 flex-1 font-semibold">{pick.label}</span>
+                                              <span>{Math.round(pick.confidence * 100)}%</span>
+                                              <button type="button" disabled={selectedAudiences.includes(pick.id)}
+                                                onClick={() => {
+                                                  manualAudienceFingerprint.current = currentAudienceFingerprint;
+                                                  setSelectedAudiences(selected => selected.includes(pick.id) ? selected : [...selected, pick.id]);
+                                                }}
+                                                className="rounded border px-2 py-1 disabled:opacity-60 focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-500">
+                                                {selectedAudiences.includes(pick.id) ? 'Selected' : 'Add'}
+                                              </button>
+                                            </div>
+                                            {pick.evidence.length > 0 && (
+                                              <details className="mt-1">
+                                                <summary className="cursor-pointer">JD evidence</summary>
+                                                {pick.evidence.map((quote, index) => (
+                                                  <blockquote key={index} className="mt-1 border-l-2 border-emerald-500 pl-2 break-words">{quote}</blockquote>
+                                                ))}
+                                              </details>
+                                            )}
+                                          </li>
+                                        ))}
+                                      </ol>
+                                      {currentAudienceDecision.customPersona && (
+                                        <button type="button" className="text-left underline break-words focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-500"
+                                          onClick={() => {
+                                            manualAudienceFingerprint.current = currentAudienceFingerprint;
+                                            setCustomAudience(currentAudienceDecision.customPersona!);
+                                            setSelectedAudiences(['custom']);
+                                          }}>
+                                          Use as custom persona: {currentAudienceDecision.customPersona}
+                                        </button>
+                                      )}
+                                      {currentAudienceDecision.warnings.length > 0 && (
+                                        <p className={`truncate ${isDarkMode ? 'text-amber-300' : 'text-amber-800'}`} title={currentAudienceDecision.warnings.join(' ')}>
+                                          {currentAudienceDecision.warnings[0]}
+                                        </p>
+                                      )}
+                                    </>
+                                  ) : <p>Paste a job description, then click Auto-Select.</p>}
+                                  <div className={`border-t pt-2 space-y-2 ${isDarkMode ? 'border-white/15' : 'border-slate-200'}`}>
+                                    <label className="flex items-start gap-2">
+                                      <input type="checkbox" checked={autoAudienceEnabled}
+                                        onChange={() => setAutoAudienceEnabled(enabled => !enabled)} />
+                                      Auto-select when the JD changes
+                                    </label>
+                                    <p>Each selected audience creates its own resume version.</p>
+                                  </div>
+                                </div>,
+                                document.body,
+                              )}
                               <button
-                                onClick={() => setIsAudienceDropdownOpen(!isAudienceDropdownOpen)}
+                                ref={audienceFieldRef}
+                                onClick={() => {
+                                  setIsAudienceDetailsOpen(false);
+                                  setIsAudienceDropdownOpen(!isAudienceDropdownOpen);
+                                }}
                                 className={`w-full px-3 py-2 text-xs border rounded-lg flex items-center justify-between transition-all ${
                                   isDarkMode ? 'bg-black text-white border-white/10' : 'bg-white text-black border-black/10'
                                 }`}
@@ -3760,7 +3693,9 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                                   {selectedAudiences.length > 0
                                     ? (
                                       <>
-                                        <span className="text-[10px] bg-blue-500/20 text-blue-400 px-1.5 py-0.5 rounded font-bold uppercase tracking-tighter">Auto</span>
+                                        {isAutomaticAudienceSelection && (
+                                          <span className={`text-xs px-1.5 py-0.5 rounded font-bold ${isDarkMode ? 'bg-blue-500/20 text-blue-300' : 'bg-blue-50 text-blue-700'}`}>AI</span>
+                                        )}
                                         {selectedAudiences.map(id => id === 'custom' ? (customAudience || 'Custom Persona') : (AUDIENCES.find(a => a.id === id)?.label || id)).join(', ')}
                                       </>
                                     )
@@ -3776,6 +3711,7 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                                     <button 
                                       onClick={(e) => {
                                         e.stopPropagation();
+                                        manualAudienceFingerprint.current = jdFingerprint(jobDescription, targetRole);
                                         setSelectedAudiences(['microsoft']);
                                       }}
                                       className="flex-1 py-1 text-[10px] font-bold uppercase tracking-widest bg-emerald-500/10 text-emerald-500 rounded hover:bg-emerald-500/20 transition-colors"
@@ -3785,6 +3721,7 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                                     <button 
                                       onClick={(e) => {
                                         e.stopPropagation();
+                                        manualAudienceFingerprint.current = jdFingerprint(jobDescription, targetRole);
                                         setSelectedAudiences([]);
                                       }}
                                       className="flex-1 py-1 text-[10px] font-bold uppercase tracking-widest bg-red-500/10 text-red-500 rounded hover:bg-red-500/20 transition-colors"
@@ -4301,6 +4238,43 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                             />
                             <p className="text-[10px] opacity-40 mt-1">These instructions will be given high priority during the resume optimization process.</p>
                           </div>
+
+                          <div className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl border text-[11px] ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-gray-50 border-black/5'}`}>
+                            <span className="min-w-0">
+                              <span className="block text-[10px] font-bold uppercase tracking-widest">LinkedIn Trends</span>
+                              <span className={isDarkMode ? 'opacity-60' : 'opacity-70'}>
+                                {trendPreview
+                                  ? `Curated for ${trendPreview.label} (reviewed ${trendPreview.as_of}); unsupported skills are never added.`
+                                  : 'Off - trending skills are not considered.'}
+                              </span>
+                            </span>
+                            <button
+                              type="button"
+                              role="switch"
+                              aria-checked={followLinkedInTrends}
+                              aria-label="Follow LinkedIn trends"
+                              onClick={() => setFollowLinkedInTrends((enabled) => !enabled)}
+                              className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                                followLinkedInTrends ? 'bg-emerald-500' : isDarkMode ? 'bg-white/15' : 'bg-black/15'
+                              }`}
+                            >
+                              <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transition-transform ${followLinkedInTrends ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+                            </button>
+                          </div>
+
+                          <div className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl border text-[11px] ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-gray-50 border-black/5'}`}>
+                            <span className="min-w-0 truncate" title={bulletRulesSummary(bulletRules).join(' · ')}>
+                              <span className="text-[10px] font-bold uppercase tracking-widest">Bullet Rules: </span>
+                              <span className={isDarkMode ? 'opacity-60' : 'opacity-70'}>
+                                {!bulletRules.enabled
+                                  ? 'Off - using tenure-based budgets'
+                                  : bulletRulesSummary(bulletRules).join(' · ') || 'Enabled; remaining roles use tenure'}
+                              </span>
+                            </span>
+                            <Link to="/profile" className="shrink-0 text-[10px] font-bold uppercase tracking-widest text-emerald-500 hover:underline">
+                              Edit
+                            </Link>
+                          </div>
                         
                         {/* Optimize Button Section */}
                           <div className="pt-4 border-t border-black/5 dark:border-white/10">
@@ -4747,6 +4721,14 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                     )}
                   </section>
 
+                  <BulletRulesSettings
+                    rules={bulletRules}
+                    onChange={setBulletRules}
+                    isDarkMode={isDarkMode}
+                    resumeText={resumeText}
+                    jobDescription={jobDescription}
+                  />
+
                   {/* Google Drive Status/Reconnect */}
                   {!driveAccessToken && user && (
                     <div className="mt-6 p-4 rounded-xl border border-dashed border-blue-500/30 bg-blue-500/5">
@@ -5186,6 +5168,7 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                           <button 
                             onClick={copyResumeText}
                             className={`p-1.5 md:p-2 rounded-lg transition-colors text-[8px] md:text-[10px] font-bold uppercase tracking-wider flex items-center gap-1.5 md:gap-2 ${isDarkMode ? 'hover:bg-white/10' : 'hover:bg-black/5'}`}
+                            disabled={isPiiMasked}
                             title="Copy text for selectable use"
                           >
                             <Copy className="w-3.5 h-3.5 md:w-4 md:h-4" />
@@ -5211,6 +5194,7 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                           <div className="flex items-center gap-1">
                             <button 
                               onClick={handleDownloadDOCX}
+                              disabled={isPiiMasked}
                               className="px-2 md:px-3 py-1.5 md:py-2 rounded-lg bg-blue-500 text-white hover:bg-blue-600 transition-colors text-[8px] md:text-[10px] font-bold uppercase tracking-wider flex items-center gap-1.5 md:gap-2 shadow-lg shadow-blue-500/10"
                               title="Download as Word Document"
                             >
@@ -5219,7 +5203,7 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                             </button>
                             <button 
                               onClick={downloadPDF}
-                              disabled={isDownloading}
+                              disabled={isDownloading || isPiiMasked}
                               className="px-2 md:px-3 py-1.5 md:py-2 rounded-lg bg-emerald-500 text-white hover:bg-emerald-600 transition-colors text-[8px] md:text-[10px] font-bold uppercase tracking-wider flex items-center gap-1.5 md:gap-2 disabled:opacity-50 shadow-lg shadow-emerald-500/10"
                             >
                               {isDownloading ? (
@@ -5234,6 +5218,7 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                       </div>
                     </div>
                     
+                    <AtsCompatibilityCard issues={compatibilityIssues} masked={isPiiMasked} onCopy={copyResumeText} />
                     <div 
                       ref={previewContainerRef}
                       className={`w-full flex-1 min-h-0 overflow-auto flex items-start justify-center ${isDarkMode ? 'bg-[#1A1A1A]' : 'bg-gray-200/50'} custom-scrollbar`}
@@ -5259,25 +5244,28 @@ ${(res.education || [] as any[]).map(edu => typeof edu === 'string' ? edu : `${e
                               className={`transition-all duration-300 relative ${activeSection ? 'ring-2 ring-emerald-500/20' : ''} ${isDownloading ? 'legacy-colors' : 'shadow-2xl'}`}
                             >
                           {previewMode === 'standard' ? (
-                            <div className="resume-page" style={{ paddingBottom: isDownloading ? '0' : '2rem' }}>
-                              {renderSection('header')}
-                              {renderSection('summary')}
-                              {renderSection('skills')}
-                              {renderSection('certifications')}
-                              {/* Pass the FULL array, do not slice. Let the print engine handle pagination */}
-                              {renderSection('experience', results[activeAudience!]?.experience || data.experience)}
-                              {renderSection('projects')}
-                              {renderSection('education')}
+                            <div className="resume-page bg-white text-black" style={{ width: '210mm', minHeight: '297mm', padding: '16mm' }}>
+                              {exportSections(canonicalBlocks).map(id => renderSection(id))}
                             </div>
-                          ) : (
-                            renderSimplifiedResume()
-                          )}
+                          ) : renderSimplifiedResume()}
                           </div>
                           </div>
                         </div>
                       ) : (
                         <div className="w-full max-w-5xl mx-auto h-full p-4 md:p-8">
                           <Suspense fallback={<LoadingSpinner />}>
+                            {activeAudience && results[activeAudience]?.bullet_budget_report && (
+                              <BulletBudgetReportCard
+                                report={results[activeAudience].bullet_budget_report}
+                                isDarkMode={isDarkMode}
+                              />
+                            )}
+                            {activeAudience && results[activeAudience]?.linkedin_trends && (
+                              <LinkedInTrendsCard
+                                report={results[activeAudience].linkedin_trends}
+                                isDarkMode={isDarkMode}
+                              />
+                            )}
                             <NexusProInsights 
                                isDarkMode={isDarkMode} 
                                starStories={activeAudience ? results[activeAudience]?.star_stories : undefined}
