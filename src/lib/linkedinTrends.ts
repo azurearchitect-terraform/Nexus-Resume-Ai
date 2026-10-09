@@ -6,6 +6,7 @@
  */
 import { buildTermPattern, detectJdPlatforms, findTerms } from "./bulletBudget";
 import { MARKET_TREND_METHOD, readMarketMetadata, type MarketTrendMetadata } from "./jobMarketTrends";
+import { IMPORT_TREND_METHOD, readImportMetadata, type TrendImportMetadata } from "./trendImportMetadata";
 
 export const TREND_METHOD = "linkedin-trends-v1";
 export const TREND_COVERAGE_METHOD = "linkedin-trend-coverage-v1";
@@ -15,6 +16,11 @@ export const MAX_TREND_SKILLS = 32;
 
 /** Never suggested, whatever the source says (mirrors the per-role generator's forbidden terms). */
 const BANNED_TREND_TERMS = /\bci\s*\/\s*cd\b|\bpipelines?\b|\bdevops\b|\bdevsecops\b/i;
+
+/** True for the terms the generation prompts forbid (CI/CD, Pipelines, DevOps, DevSecOps). */
+export function isBannedTrendTerm(text: unknown): boolean {
+  return BANNED_TREND_TERMS.test(typeof text === "string" ? text : "");
+}
 
 /**
  * The names the generation prompts mandate in place of the banned terms. Material
@@ -44,6 +50,7 @@ export interface LinkedInTrends {
   as_of: string;
   skills: TrendSkill[];
   market?: MarketTrendMetadata;
+  imported?: TrendImportMetadata;
 }
 
 /**
@@ -84,6 +91,7 @@ export interface TrendCoverageReport {
   /** used / (used + available) as a whole percentage; null when nothing is evidenced. */
   coverage: number | null;
   market?: MarketTrendMetadata;
+  imported?: TrendImportMetadata;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1023,7 +1031,7 @@ export function normalizeTrendSkills(raw: unknown): TrendSkill[] {
   for (const item of list.slice(0, 200)) {
     const record = item && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>) : null;
     const rawName = typeof item === "string" ? item : asText(record?.name ?? record?.skill ?? record?.title);
-    const stripped = cleanLine(rawName, 200).replace(/^(?:[-*\u2022]+|\d+[.)])\s*/, "");
+    const stripped = cleanLine(rawName, 200).replace(/^(?:[-*\u2022]+\s*|\d+[.)]\s+)/, "");
     if (!stripped || BANNED_TREND_TERMS.test(stripped)) continue;
     const inner = Array.from(stripped.matchAll(/\(([^)]*)\)/g)).flatMap((match) => match[1].split(/[/,]/));
     const name = stripped.replace(/\([^)]*\)/g, " ").replace(/\s+/g, " ").replace(/[\s,;:]+$/, "").trim();
@@ -1056,8 +1064,12 @@ export function normalizeLinkedInTrends(raw: unknown): LinkedInTrends | null {
   const roleFamily = sanitizeKey(record.role_family) || families[0] || "general";
   const market = readMarketMetadata(record.market);
   if (record.method === MARKET_TREND_METHOD && !market) return null;
+  const imported = readImportMetadata(record.imported);
+  if (record.method === IMPORT_TREND_METHOD && !imported) return null;
+  // A snapshot has exactly one source: both at once means the record was tampered with.
+  if (market && imported) return null;
   return {
-    method: market ? MARKET_TREND_METHOD : TREND_METHOD,
+    method: market ? MARKET_TREND_METHOD : imported ? IMPORT_TREND_METHOD : TREND_METHOD,
     role_family: roleFamily,
     families: families.length ? families : [roleFamily],
     label: cleanLine(record.label, 120) || FAMILY_BY_ID.get(roleFamily)?.label || "Target role",
@@ -1065,6 +1077,7 @@ export function normalizeLinkedInTrends(raw: unknown): LinkedInTrends | null {
     as_of: sanitizeTrendDate(record.as_of) || CURATED_TRENDS_REVIEWED,
     skills,
     ...(market ? { market } : {}),
+    ...(imported ? { imported } : {}),
   };
 }
 
@@ -1333,6 +1346,7 @@ export function computeTrendCoverage(
     target_role: trends.target_role,
     as_of: trends.as_of,
     ...(trends.market ? { market: trends.market } : {}),
+    ...(trends.imported ? { imported: trends.imported } : {}),
     entries,
     used,
     available,
@@ -1404,13 +1418,18 @@ export function describeTrendSource(trends: LinkedInTrends | null | undefined): 
     const m = trends.market;
     return `Adzuna job-market demand for ${trends.label}; ${m.sample_size} sampled posting snippets across ${m.countries.join(", ")}; refreshed ${m.refreshed_at}${m.stale ? " (STALE)" : ""}`;
   }
+  if (trends.imported) {
+    const i = trends.imported;
+    return `LinkedIn data imported by the candidate: ${i.source}, published ${i.published_at}, region ${i.region}, role ${i.role}; ${i.used} skills; not verified by this application`;
+  }
   return `Curated skill catalogue for ${trends.label || "the target role"} (labelled ${trends.as_of || CURATED_TRENDS_REVIEWED}; not live data)`;
 }
 
 /** Stable text that changes whenever the trend list does (for cache keys). */
 export function trendFingerprint(trends: LinkedInTrends | null | undefined): string {
   if (!trends || !trends.skills.length) return "none";
-  return [trends.market?.refreshed_at || trends.as_of, trends.families.join("+"), trends.skills.map((skill) => trendNameKey(skill.name)).join("|")].join(":");
+  const stamp = trends.market?.refreshed_at || trends.imported?.imported_at || trends.as_of;
+  return [stamp, trends.families.join("+"), trends.skills.map((skill) => trendNameKey(skill.name)).join("|")].join(":");
 }
 
 export interface TrendBriefOptions {
@@ -1432,6 +1451,9 @@ export function buildTrendBrief(trends: LinkedInTrends | null | undefined, optio
   const skills = trends.skills.slice(0, MAX_TREND_SKILLS);
   const label = trends.label || "the target role";
   const evidence = skillEvidence(skills, asText(options.evidenceText));
+  const words = trends.imported
+    ? { role: "LINKEDIN-IMPORTED SKILLS", document: "LINKEDIN TREND ALIGNMENT", supports: "imported LinkedIn", none: "imported LinkedIn" }
+    : { role: "JOB-MARKET SKILLS", document: "JOB-MARKET SKILL ALIGNMENT", supports: "market", none: "listed market" };
 
   if (options.scope === "role") {
     const secondary = skillEvidence(skills, asText(options.secondaryEvidenceText));
@@ -1439,11 +1461,11 @@ export function buildTrendBrief(trends: LinkedInTrends | null | undefined, optio
     const listed = skills.filter((_, i) => !evidence[i].length && secondary[i].length > 0).slice(0, BRIEF_ROLE_MAX);
     if (!own.length && !listed.length) {
       return [
-        `JOB-MARKET SKILLS (${label}):`,
+        `${words.role} (${label}):`,
         "- This role's source shows none of the trending skills. Do not name any trending skill, tool or platform the source does not show.",
       ].join("\n");
     }
-    const lines = [`JOB-MARKET SKILLS (${label}) - use these evidenced names:`];
+    const lines = [`${words.role} (${label}) - use these evidenced names:`];
     if (own.length) {
       lines.push(`- Shown in this role's source - use the exact name when a bullet covers that work: ${own.map((skill) => skill.name).join(", ")}.`);
     }
@@ -1460,16 +1482,16 @@ export function buildTrendBrief(trends: LinkedInTrends | null | undefined, optio
     .map((skill, i) => ({ skill, terms: evidence[i] }))
     .filter((item) => item.terms.length > 0)
     .slice(0, BRIEF_DOCUMENT_MAX);
-  const header = `JOB-MARKET SKILL ALIGNMENT (${describeTrendSource(trends)}):`;
+  const header = `${words.document} (${describeTrendSource(trends)}):`;
   if (!supported.length) {
     return [
       header,
-      "- None of the listed market skills appear in the candidate's material. Do not add them; the candidate sees them as gaps to close.",
+      `- None of the ${words.none} skills appear in the candidate's material. Do not add them; the candidate sees them as gaps to close.`,
     ].join("\n");
   }
   const lines = [
     header,
-    "The candidate's material supports these market skills - use their exact names:",
+    `The candidate's material supports these ${words.supports} skills - use their exact names:`,
     ...supported.map(({ skill, terms }) => {
       const shown = terms.filter((term) => trendNameKey(term) !== trendNameKey(skill.name)).slice(0, 3);
       return `- ${skill.name}${shown.length ? ` (source shows: ${shown.join(", ")})` : ""}`;

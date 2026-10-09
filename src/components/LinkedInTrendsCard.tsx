@@ -7,6 +7,8 @@ import {
   describeTrendSource,
   trendsFromReport,
 } from '../lib/linkedinTrends';
+import { readMarketMetadata } from '../lib/jobMarketTrends';
+import { readImportMetadata } from '../lib/trendImportMetadata';
 
 interface LinkedInTrendsCardProps {
   /** resume.linkedin_trends. Anything the pipeline did not write renders nothing. */
@@ -81,31 +83,66 @@ export const LinkedInTrendsCard: React.FC<LinkedInTrendsCardProps> = ({ report: 
   const asOf = typeof report.as_of === 'string' && report.as_of ? report.as_of : CURATED_TRENDS_REVIEWED;
   const supported = report.used.length + report.available.length;
   const sections = SECTIONS.filter((section) => report[section.key].length > 0);
+  // The report may come from storage or the model: read both source blocks through their validators.
+  const market = readMarketMetadata(report.market);
+  const imported = readImportMetadata(report.imported);
   const source = describeTrendSource(trendsFromReport(report)) || `Curated skills for ${label} (reviewed ${asOf})`;
+  const title = imported ? 'LinkedIn Trends (imported)' : market ? 'Job Market Trends' : 'Skill Trends (curated catalogue)';
+  const hasSignals = imported?.signals.some((s) => s.rank !== null || s.growth !== null || s.share !== null) ?? false;
   return (
     <div className={`p-4 rounded-xl border ${isDarkMode ? 'glass-panel border-white/10' : 'glass-panel-light border-black/5'}`}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <h3 className={`text-xs font-bold uppercase tracking-widest ${isDarkMode ? 'text-blue-400' : 'text-blue-700'}`}>Job Market Trends</h3>
+          <h3 className={`text-xs font-bold uppercase tracking-widest ${isDarkMode ? 'text-blue-400' : 'text-blue-700'}`}>{title}</h3>
           <p className="text-[10px] mt-1 opacity-70" title={source}>
             {source}
           </p>
-          {report.market && (
+          {imported && (
+            <div className="text-[10px] mt-1 opacity-70 space-y-0.5">
+              <p>
+                Source: {imported.source} &middot; Published: {imported.published_at} &middot; Region: {imported.region} &middot; Role: {imported.role}
+              </p>
+              <p>
+                Imported {imported.imported_at.slice(0, 10)} &middot; {imported.used} of {imported.rows} skills used &middot; supplied by you,
+                not verified by Nexus &middot; you confirmed permission to use it on {imported.permission_confirmed_at.slice(0, 10)}.
+              </p>
+              {imported.warnings.length > 0 && <p>{imported.warnings.join(' ')}</p>}
+            </div>
+          )}
+          {imported && hasSignals && (
+            <details className="text-[10px] mt-2">
+              <summary className="cursor-pointer">Numbers from your file (not resume coverage)</summary>
+              <table className="mt-1 w-full text-left">
+                <thead><tr><th>Skill</th><th>Rank</th><th>Growth</th><th>Share</th></tr></thead>
+                <tbody>
+                  {imported.signals.map((s) => (
+                    <tr key={s.name}>
+                      <td>{s.name}</td>
+                      <td>{s.rank ?? '-'}</td>
+                      <td>{s.growth === null ? '-' : `${s.growth > 0 ? '+' : ''}${s.growth}%`}</td>
+                      <td>{s.share === null ? '-' : `${s.share}%`}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </details>
+          )}
+          {market && (
             <p className="text-[10px] mt-1 opacity-70">
-              {report.market.remote_postings} postings mention remote work.
-              {report.market.previous_sample_at
-                ? ` Demand changes compare with ${report.market.previous_sample_at}.`
+              {market.remote_postings} postings mention remote work.
+              {market.previous_sample_at
+                ? ` Demand changes compare with ${market.previous_sample_at}.`
                 : ' First or non-comparable sample: no growth trend claimed.'}
-              {' '}{report.market.warnings.join(' ')}
+              {' '}{market.warnings.join(' ')}
             </p>
           )}
-          {report.market && (
+          {market && (
             <details className="text-[10px] mt-2">
               <summary className="cursor-pointer">Sampled skill demand (not resume coverage)</summary>
               <table className="mt-1 w-full text-left">
                 <thead><tr><th>Skill</th><th>Postings</th><th>Sample share</th><th>Change</th></tr></thead>
                 <tbody>
-                  {report.market.demand.filter(d => d.postings > 0).map(d => (
+                  {market.demand.filter(d => d.postings > 0).map(d => (
                     <tr key={d.name}>
                       <td>{d.name}</td><td>{d.postings}</td><td>{d.share}%</td>
                       <td>{d.change === null ? 'No baseline' : `${d.change > 0 ? '+' : ''}${d.change} pp`}</td>

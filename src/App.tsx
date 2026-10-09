@@ -66,6 +66,7 @@ import { ResumeHealthScore } from './components/ResumeHealthScore';
 import { BulletRulesSettings } from './components/BulletRulesSettings';
 import { BulletBudgetReportCard } from './components/BulletBudgetReportCard';
 import { LinkedInTrendsCard } from './components/LinkedInTrendsCard';
+import { LinkedInTrendImport } from './components/LinkedInTrendImport';
 import { audienceBrief, audiencesToApply, describeAppliedAudiences, jdFingerprint, selectionMatchesDecision, type AudienceDecision } from './lib/audienceIntelligence';
 import { MODE_DESCRIPTIONS, AUDIENCES, MODEL_PRICING, TARGET_COMPANIES, BACKGROUND_THEMES } from './constants';
 import { downloadDOCX, downloadJSON } from './services/exportService';
@@ -114,6 +115,13 @@ import { TermsModal } from './components/TermsModal';
 import { describeMatchScore } from './lib/matchScore';
 import { selectMasterSource, type MasterComparison } from './lib/masterSelection';
 import { fetchJobMarketTrends } from './lib/trendClient';
+import {
+  OLD_IMPORT_DAYS,
+  importAgeDays,
+  importedTrends,
+  normalizeTrendImportRecord,
+  type TrendImportRecord,
+} from './lib/linkedinImport';
 import type { LinkedInTrends } from './lib/linkedinTrends';
 import { describeImpactScore } from './lib/impactScore';
 import { defaultBulletRules, normalizeBulletRules, type BulletRules } from './lib/bulletBudget';
@@ -139,6 +147,28 @@ type OptimizationMode = 'conservative' | 'balanced' | 'aggressive' | 'automatic'
 
 const BULLET_RULES_STORAGE_KEY = 'nexus_bullet_rules';
 const LINKEDIN_TRENDS_STORAGE_KEY = 'nexus_follow_linkedin_trends';
+const TREND_SOURCE_STORAGE_KEY = 'nexus_trend_source';
+const TREND_IMPORT_STORAGE_KEY = 'nexus_linkedin_trend_import';
+
+/** Where trend guidance comes from: the daily Adzuna job-market snapshot, or data the candidate imported from LinkedIn. */
+type TrendSource = 'market' | 'linkedin-import';
+
+function loadTrendSource(): TrendSource {
+  try {
+    return localStorage.getItem(TREND_SOURCE_STORAGE_KEY) === 'linkedin-import' ? 'linkedin-import' : 'market';
+  } catch {
+    return 'market';
+  }
+}
+
+function loadTrendImport(): TrendImportRecord | null {
+  try {
+    const saved = localStorage.getItem(TREND_IMPORT_STORAGE_KEY);
+    return saved ? normalizeTrendImportRecord(JSON.parse(saved)) : null;
+  } catch {
+    return null;
+  }
+}
 
 function loadSavedBulletRules(): BulletRules {
   try {
@@ -247,14 +277,19 @@ export default function App() {
   const [customPrompt, setCustomPrompt] = useState('');
   const [bulletRules, setBulletRules] = useState<BulletRules>(loadSavedBulletRules);
   const [followLinkedInTrends, setFollowLinkedInTrends] = useState<boolean>(loadFollowLinkedInTrends);
+  const [trendSource, setTrendSource] = useState<TrendSource>(loadTrendSource);
+  const [linkedInTrendImport, setLinkedInTrendImport] = useState<TrendImportRecord | null>(loadTrendImport);
   useEffect(() => {
     try {
       localStorage.setItem(BULLET_RULES_STORAGE_KEY, JSON.stringify(bulletRules));
       localStorage.setItem(LINKEDIN_TRENDS_STORAGE_KEY, String(followLinkedInTrends));
+      localStorage.setItem(TREND_SOURCE_STORAGE_KEY, trendSource);
+      if (linkedInTrendImport) localStorage.setItem(TREND_IMPORT_STORAGE_KEY, JSON.stringify(linkedInTrendImport));
+      else localStorage.removeItem(TREND_IMPORT_STORAGE_KEY);
     } catch {
       // Keep the settings active for this session when local storage is unavailable.
     }
-  }, [bulletRules, followLinkedInTrends]);
+  }, [bulletRules, followLinkedInTrends, trendSource, linkedInTrendImport]);
   const [isDriveConnected, setIsDriveConnected] = useState(() => {
     return localStorage.getItem('isDriveConnected') === 'true';
   });
@@ -466,7 +501,7 @@ export default function App() {
   useEffect(() => {
     if (isInitialLoad.current) return;
     if (user) setHasUnsavedChanges(true);
-  }, [resumeText, customPrompt, bulletRules, followLinkedInTrends, isDriveConnected, versioningEnabled, isAutosaveEnabled, selectedDriveFolder, driveAccessToken, user, masterResumes]);
+  }, [resumeText, customPrompt, bulletRules, followLinkedInTrends, trendSource, linkedInTrendImport, isDriveConnected, versioningEnabled, isAutosaveEnabled, selectedDriveFolder, driveAccessToken, user, masterResumes]);
   const [jobDescription, setJobDescription] = useState('');
   const location = useLocation();
   const navigate = useNavigate();
@@ -484,6 +519,10 @@ export default function App() {
       : null,
     [followLinkedInTrends, targetRole, deferredJobDescription]
   );
+  useEffect(() => {
+    // The last run's source line describes a different source once these change.
+    setMarketTrendStatus('');
+  }, [trendSource, followLinkedInTrends, linkedInTrendImport]);
   const [companyName, setCompanyName] = useState('');
   const [mode, setMode] = useState<OptimizationMode>('balanced');
   const [fastMode, setFastMode] = useState(false);
@@ -592,6 +631,16 @@ export default function App() {
             if (savedBulletRules) setBulletRules(savedBulletRules);
             if (typeof data.followLinkedInTrends === 'boolean') {
               setFollowLinkedInTrends(data.followLinkedInTrends);
+            }
+            if (data.trendSource === 'market' || data.trendSource === 'linkedin-import') {
+              setTrendSource(data.trendSource);
+            }
+            // An explicit null means the import was removed on another device; an invalid value is ignored.
+            if (data.linkedInTrendImport === null) {
+              setLinkedInTrendImport(null);
+            } else {
+              const savedImport = normalizeTrendImportRecord(data.linkedInTrendImport);
+              if (savedImport) setLinkedInTrendImport(savedImport);
             }
             if (data.settings) {
               if (typeof data.settings.versioningEnabled === 'boolean') {
@@ -921,6 +970,8 @@ export default function App() {
         customPrompt: customPrompt || "",
         bulletRules,
         followLinkedInTrends,
+        trendSource,
+        linkedInTrendImport: linkedInTrendImport ?? null,
         settings: {
           versioningEnabled,
           isAutosaveEnabled,
@@ -957,7 +1008,7 @@ export default function App() {
     }, 2000); // Sync 2 seconds after last change
 
     return () => clearTimeout(timeoutId);
-  }, [hasUnsavedChanges, user, resumeText, customPrompt, bulletRules, followLinkedInTrends, isDriveConnected, versioningEnabled, isAutosaveEnabled, selectedDriveFolder, driveAccessToken, masterResumes]);
+  }, [hasUnsavedChanges, user, resumeText, customPrompt, bulletRules, followLinkedInTrends, trendSource, linkedInTrendImport, isDriveConnected, versioningEnabled, isAutosaveEnabled, selectedDriveFolder, driveAccessToken, masterResumes]);
 
   useEffect(() => {
     const handleBeforeUnload = () => {
@@ -1024,6 +1075,8 @@ export default function App() {
         customPrompt: customPrompt,
         bulletRules,
         followLinkedInTrends,
+        trendSource,
+        linkedInTrendImport: linkedInTrendImport ?? null,
         settings: {
           versioningEnabled,
           isAutosaveEnabled,
@@ -2530,7 +2583,32 @@ export default function App() {
         setMasterComparison([]);
       }
       let jobMarketTrends: LinkedInTrends | null = null;
-      if (followLinkedInTrends) {
+      let trendImportForRun: TrendImportRecord | null = null;
+      if (followLinkedInTrends && trendSource === 'linkedin-import') {
+        // The candidate chose their own LinkedIn data: never substitute the job-market snapshot for it.
+        if (!linkedInTrendImport) {
+          setMarketTrendStatus('No LinkedIn data imported yet. Import it below or switch to Job market. This optimization runs without trends.');
+          showToast("No imported LinkedIn data. Continuing without trends.", "info");
+        } else {
+          try {
+            const resolved = importedTrends(linkedInTrendImport, targetRole, optimizationJobDescription);
+            const meta = resolved.imported!;
+            jobMarketTrends = resolved;
+            trendImportForRun = linkedInTrendImport;
+            setMarketTrendStatus(
+              `LinkedIn data you imported (${meta.source}), published ${meta.published_at}, ${meta.region}, ${meta.role}: ${meta.used} of ${meta.rows} skills used. ${meta.warnings.join(' ')}`
+            );
+            if (importAgeDays(meta.published_at) > OLD_IMPORT_DAYS) {
+              showToast("Your imported LinkedIn data was published over a year ago.", "info");
+            }
+          } catch (e) {
+            // Trend guidance is optional: a problem with the stored import must not stop the optimization.
+            console.warn("[Nexus AI] Imported LinkedIn data could not be used:", e);
+            setMarketTrendStatus('Your imported LinkedIn data could not be used. Import it again. This optimization runs without trends.');
+            showToast("Imported LinkedIn data could not be used. Continuing without trends.", "info");
+          }
+        }
+      } else if (followLinkedInTrends) {
         setOptimizationStatus("Loading daily job-market demand...");
         try {
           jobMarketTrends = await fetchJobMarketTrends(
@@ -2605,7 +2683,7 @@ export default function App() {
           targetCompany,
           brainDump,
           {
-            bulletRules, linkedinTrends: Boolean(jobMarketTrends), jobMarketTrends,
+            bulletRules, linkedinTrends: Boolean(jobMarketTrends), jobMarketTrends, trendImport: trendImportForRun,
             audienceBrief: audienceBrief(
               optimizationAudienceDecision?.fingerprint === jdFingerprint(optimizationJobDescription, targetRole) ? optimizationAudienceDecision : null,
               audienceId
@@ -4368,18 +4446,24 @@ export default function App() {
 
                           <div className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl border text-[11px] ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-gray-50 border-black/5'}`}>
                             <span className="min-w-0">
-                              <span className="block text-[10px] font-bold uppercase tracking-widest">Job Market Trends</span>
+                              <span className="block text-[10px] font-bold uppercase tracking-widest">Trend Alignment</span>
                               <span className={isDarkMode ? 'opacity-60' : 'opacity-70'}>
-                                {trendPreview
-                                  ? marketTrendStatus || `Adzuna demand for ${trendPreview.label}: India and supported APAC markets, including remote-posting searches. Loaded on Optimize; unsupported skills are never added.`
-                                  : 'Off - trending skills are not considered.'}
+                                {!followLinkedInTrends
+                                  ? 'Off - trending skills are not considered.'
+                                  : marketTrendStatus || (
+                                    trendSource === 'linkedin-import'
+                                      ? linkedInTrendImport
+                                        ? 'Using the LinkedIn data you imported; unsupported skills are never added.'
+                                        : 'Import your LinkedIn data below. Until you do, trends are skipped.'
+                                      : `Adzuna demand for ${trendPreview?.label ?? 'the target role'}: India and supported APAC markets, including remote-posting searches. Loaded on Optimize; unsupported skills are never added.`
+                                  )}
                               </span>
                             </span>
                             <button
                               type="button"
                               role="switch"
                               aria-checked={followLinkedInTrends}
-                              aria-label="Use daily job-market trends"
+                              aria-label="Use trend alignment"
                               onClick={() => setFollowLinkedInTrends((enabled) => !enabled)}
                               className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
                                 followLinkedInTrends ? 'bg-emerald-500' : isDarkMode ? 'bg-white/15' : 'bg-black/15'
@@ -4388,6 +4472,47 @@ export default function App() {
                               <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transition-transform ${followLinkedInTrends ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
                             </button>
                           </div>
+
+                          {followLinkedInTrends && (
+                            <div className="space-y-2">
+                              <div role="radiogroup" aria-label="Trend source" className="flex flex-wrap gap-1.5">
+                                {([
+                                  ['market', 'Job market (Adzuna, daily)'],
+                                  ['linkedin-import', 'My LinkedIn data'],
+                                ] as const).map(([id, label]) => (
+                                  <button
+                                    key={id}
+                                    type="button"
+                                    role="radio"
+                                    aria-checked={trendSource === id}
+                                    onClick={() => setTrendSource(id)}
+                                    className={`px-3 py-1.5 rounded-lg border text-[10px] font-bold uppercase tracking-widest transition-colors ${
+                                      trendSource === id
+                                        ? 'bg-emerald-500/10 text-emerald-500 border-emerald-500/30'
+                                        : isDarkMode ? 'border-white/10 hover:bg-white/10' : 'border-black/10 hover:bg-black/5'
+                                    }`}
+                                  >
+                                    {label}
+                                  </button>
+                                ))}
+                              </div>
+                              {trendSource === 'linkedin-import' && (
+                                <LinkedInTrendImport
+                                  record={linkedInTrendImport}
+                                  defaultRole={targetRole}
+                                  isDarkMode={isDarkMode}
+                                  onSave={(record) => {
+                                    setLinkedInTrendImport(record);
+                                    showToast(`Imported ${record.skills.length} LinkedIn skills.`, 'success');
+                                  }}
+                                  onRemove={() => {
+                                    setLinkedInTrendImport(null);
+                                    showToast('Imported LinkedIn data removed.', 'info');
+                                  }}
+                                />
+                              )}
+                            </div>
+                          )}
 
                           {masterComparison.length > 0 && (
                             <div className={`px-3 py-2 rounded-xl border text-[11px] ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-gray-50 border-black/5'}`}>

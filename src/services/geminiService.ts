@@ -17,6 +17,7 @@ import {
   trendPreferTerms,
 } from "../lib/linkedinTrends";
 import type { LinkedInTrends, TrendCoverageReport } from "../lib/linkedinTrends";
+import type { TrendImportRecord } from "../lib/linkedinImport";
 import { fetchJobMarketTrends } from "../lib/trendClient";
 import {
   buildAudiencePrompt, extractJdSignals, fuseAudienceDecision, jdFingerprint,
@@ -105,8 +106,10 @@ export interface EngineConfig {
 export interface OptimizeResumeOptions {
   bulletRules?: BulletRules | null;
   linkedinTrends?: boolean;
-  /** One server-verified snapshot shared across audiences; null explicitly disables trends. */
+  /** One resolved trend list shared across audiences (job-market snapshot or LinkedIn import); null disables trends. */
   jobMarketTrends?: LinkedInTrends | null;
+  /** The candidate's LinkedIn import when `jobMarketTrends` was built from it, so the server can rebuild the same list. */
+  trendImport?: TrendImportRecord | null;
   audienceBrief?: string;
   /** Hiring company, so the match score does not count its own name as a skill. */
   companyName?: string;
@@ -682,6 +685,12 @@ export async function optimizeResume(
     }
   }
   const { companyName } = options;
+  // The server rebuilds the trend list itself: from the import's record, or by fetching the market snapshot.
+  const trendRequest: { trendImport?: TrendImportRecord; linkedinTrends?: true } = !trends
+    ? {}
+    : trends.imported
+      ? options.trendImport ? { trendImport: options.trendImport } : {}
+      : { linkedinTrends: true };
   const analysisOptions: AnalysisOptions = { targetRole, companyName, brainDump, linkedInPdfText };
   // "Generic Tech" in the picker falls back to the hiring company, so a posting at Amazon
   // still gets Amazon's Leadership Principles as the STAR framework.
@@ -726,7 +735,7 @@ export async function optimizeResume(
           targetCompany: promptCompany,
           brainDump,
           ...(bulletRules ? { bulletRules } : {}),
-          ...(trends ? { linkedinTrends: true } : {})
+          ...trendRequest
         })
       });
 

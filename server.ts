@@ -37,6 +37,7 @@ import {
   type LinkedInTrends,
 } from "./src/lib/linkedinTrends";
 import { JobMarketTrendService } from "./server/jobMarketTrends";
+import { needsMarketTrends, resolveRequestTrends } from "./server/trendResolution";
 // import { scrapeJobs } from "./server/jobScraper";
 
 dotenv.config();
@@ -813,7 +814,8 @@ async function startServer() {
       brainDump,
       apiKey,
       bulletRules: requestedBulletRules,
-      linkedinTrends
+      linkedinTrends,
+      trendImport
     } = req.body;
 
     if (!resumeText || !jobDescription) {
@@ -821,7 +823,8 @@ async function startServer() {
     }
 
     const bulletRules = activeBulletRules(requestedBulletRules);
-    if (linkedinTrends === true) {
+    const trendRequest = { linkedinTrends, trendImport, targetRole, jobDescription };
+    if (needsMarketTrends(trendRequest)) {
       try {
         await admin.auth().verifyIdToken(idToken);
       } catch {
@@ -830,14 +833,11 @@ async function startServer() {
     }
     let trends: LinkedInTrends | null = null;
     try {
-      if (linkedinTrends === true) {
-        try {
-          trends = await getMarketTrends(targetRole, jobDescription);
-        } catch (e) {
-          // The client already showed why trends were unavailable; optimizing without them beats failing.
-          console.warn("[Pipeline] Continuing without job-market trends:", e instanceof Error ? e.message : e);
-        }
-      }
+      const resolution = await resolveRequestTrends(trendRequest, getMarketTrends);
+      if (resolution.error) return res.status(400).json({ error: resolution.error });
+      trends = resolution.trends;
+      // The client already showed why trends were unavailable; optimizing without them beats failing.
+      if (resolution.warning) console.warn("[Pipeline] Continuing without job-market trends:", resolution.warning);
       // 1. Fetch keys securely from Firestore
       const keys = await getApiKeys(idToken);
       let geminiKey = keys?.gemini || "";
