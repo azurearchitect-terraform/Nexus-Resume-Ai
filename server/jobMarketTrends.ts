@@ -127,7 +127,19 @@ export class JobMarketTrendService {
       throw new Error(`Adzuna ${country}${remote ? " remote" : ""} request failed or timed out.`);
     }
     if (!response.ok) throw new Error(`Adzuna ${country} request failed (HTTP ${response.status}).`);
-    const raw: unknown = await response.json();
+    let text: string;
+    try {
+      text = await response.text();
+    } catch {
+      throw new Error(`Adzuna ${country} response could not be read. Retry after the service recovers.`);
+    }
+    if (!text.trim()) throw new Error(`Adzuna ${country} returned an empty response (HTTP ${response.status}).`);
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      throw new Error(`Adzuna ${country} returned invalid JSON (HTTP ${response.status}).`);
+    }
     if (!raw || typeof raw !== "object" || !("results" in raw) || !Array.isArray(raw.results)) {
       throw new Error(`Adzuna ${country} returned an invalid response.`);
     }

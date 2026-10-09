@@ -90,7 +90,13 @@ test("filenames use the real candidate name and sanitize unsafe filename charact
   assert.equal(resumeFileName(resume, "Engineer/Lead", "docx"), "Jordan Candidate-Engineer Lead.docx");
   assert.equal(resumeFileName(resume, "Contoso: Ltd/EU", "docx"), "Jordan Candidate-Contoso Ltd EU.docx");
   assert.equal(resumeFileName(resume, "Contoso:\t Ltd/\u0000EU", "docx"), "Jordan Candidate-Contoso Ltd EU.docx");
-  assert.equal(resumeFileName(resume, "", "pdf"), "Jordan Candidate-Resume.pdf");
+  assert.equal(resumeFileName(resume, "", "pdf"), "Resume - Jordan Candidate.pdf");
+  assert.equal(resumeFileName(resume, "Engineer/Lead", "pdf"), "Engineer Lead - Jordan Candidate.pdf");
+  assert.equal(resumeFileName(resume, "Engineer", "pdf", "Contoso: Ltd/EU"), "Engineer - Jordan Candidate - Contoso Ltd EU.pdf");
+  assert.equal(resumeFileName(canonicalResume(source, { name: "Harnish Jariwala" }), "Cloud Architect", "pdf"),
+    "Cloud Architect - Harnish Jariwala.pdf");
+  assert.equal(resumeFileName(canonicalResume({ ...source, personal_info: { ...source.personal_info, name: "" } }), "", "pdf"),
+    "Resume - Candidate.pdf");
 });
 
 test("Standard section rendering keeps heading rules, bold skill labels and section formatting; Simplified remains plain", () => {

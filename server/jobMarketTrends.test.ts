@@ -151,6 +151,44 @@ test("provider failure without history and empty snippets cannot appear successf
   }
 });
 
+test("empty and malformed Adzuna responses are contextual and trigger cached failure backoff", async () => {
+  for (const [body, expected] of [
+    ["", /Adzuna in returned an empty response \(HTTP 200\)/],
+    [" \n\t", /Adzuna in returned an empty response/],
+    ['{"results":', /Adzuna in returned invalid JSON/],
+    ["<html>provider maintenance</html>", /Adzuna in returned invalid JSON/],
+  ] as const) {
+    const f = fixture();
+    try {
+      let calls = 0;
+      const service = new JobMarketTrendService(f.config, async () => {
+        calls++;
+        return new Response(body);
+      });
+      await assert.rejects(service.get("Azure engineer"), expected);
+      assert.equal(calls, 4);
+      await assert.rejects(service.get("Azure engineer"), expected);
+      assert.equal(calls, 4);
+    } finally { f.clean(); }
+  }
+});
+
+test("malformed provider refresh preserves a labelled stale snapshot", async () => {
+  const f = fixture();
+  try {
+    let now = Date.parse("2026-10-09T00:00:00Z");
+    let fail = false;
+    const service = new JobMarketTrendService(f.config, async () => fail ? new Response("") : ads(), () => now);
+    const first = await service.get("Azure engineer");
+    now += DAY;
+    fail = true;
+    const stale = await service.get("Azure engineer");
+    assert.equal(stale.market?.refreshed_at, first.market?.refreshed_at);
+    assert.equal(stale.market?.stale, true);
+    assert.ok(stale.market?.warnings.some(w => /Daily refresh failed:.*empty response/.test(w)));
+  } finally { f.clean(); }
+});
+
 test("live provenance survives report normalization and steers only evidenced skills", async () => {
   const f = fixture();
   try {

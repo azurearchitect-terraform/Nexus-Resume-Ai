@@ -43,6 +43,7 @@ import { needsMarketTrends, resolveRequestTrends } from "./server/trendResolutio
 dotenv.config();
 
 // Initialize Firebase Admin
+let db: admin.firestore.Firestore | undefined;
 const firebaseConfigPath = path.join(process.cwd(), "firebase-applet-config.json");
 if (!fs.existsSync(firebaseConfigPath)) {
   console.error("firebase-applet-config.json not found. Skipping Firebase initialization.");
@@ -70,7 +71,6 @@ if (!fs.existsSync(firebaseConfigPath)) {
   }
 
   // Robust Firestore initialization: fallback to default database if specific ID fails or is not provided
-  let db: admin.firestore.Firestore;
   try {
     const dbId = (firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== "")
       ? firebaseConfig.firestoreDatabaseId
@@ -82,13 +82,18 @@ if (!fs.existsSync(firebaseConfigPath)) {
   }
 }
 
+function requireFirestore(): admin.firestore.Firestore {
+  if (!db) throw new Error("Firestore is not initialized. Check firebase-applet-config.json and the server Firebase configuration.");
+  return db;
+}
+
 // Helper to get API keys from Firestore securely
 async function getApiKeys(idToken: string) {
     if (idToken === "SYSTEM_PIPELINE" || !idToken || idToken === "undefined" || idToken === "null") return null;
     try {
       const decodedToken = await admin.auth().verifyIdToken(idToken);
       const uid = decodedToken.uid;
-      const doc = await db.collection("users").doc(uid).get();
+      const doc = await requireFirestore().collection("users").doc(uid).get();
       
       if (!doc.exists) {
         return null; // Return null instead of throwing
@@ -133,7 +138,7 @@ async function getApiKeys(idToken: string) {
 // Function to log usage to Firestore
 async function logUsage(log: UsageLog) {
   try {
-    await db.collection("analytics").add({
+    await requireFirestore().collection("analytics").add({
       ...log,
       timestamp: FieldValue.serverTimestamp()
     });
@@ -710,7 +715,7 @@ async function startServer() {
   // Admin Analytics Endpoints
   app.get("/api/admin/stats", async (req, res) => {
     try {
-      const snapshot = await db.collection("analytics").get();
+      const snapshot = await requireFirestore().collection("analytics").get();
       const logs = snapshot.docs.map(doc => {
         const data = doc.data();
         return {
@@ -739,7 +744,7 @@ async function startServer() {
 
   app.get("/api/admin/usage-by-day", async (req, res) => {
     try {
-      const snapshot = await db.collection("analytics").get();
+      const snapshot = await requireFirestore().collection("analytics").get();
       const logs = snapshot.docs.map(doc => {
         const data = doc.data();
         return {
@@ -773,7 +778,7 @@ async function startServer() {
 
   app.get("/api/admin/model-usage", async (req, res) => {
     try {
-      const snapshot = await db.collection("analytics").get();
+      const snapshot = await requireFirestore().collection("analytics").get();
       const logs = snapshot.docs.map(doc => doc.data() as UsageLog);
 
       const modelData: Record<string, number> = {};
@@ -846,7 +851,7 @@ async function startServer() {
       // 1.1 Fetch Master Resumes from Firestore
       let masterResumes: any[] = [];
       try {
-        const snapshot = await db.collection("master_resumes").get();
+        const snapshot = await requireFirestore().collection("master_resumes").get();
         masterResumes = snapshot.docs.map(doc => doc.data());
         console.log(`[Pipeline] Fetched ${masterResumes.length} master resumes.`);
       } catch (err) {
@@ -1342,7 +1347,7 @@ async function startServer() {
       // ===============================
       // 6. SAVE MEMORY
       // ===============================
-      await saveResumeVersion(db, "anonymous", {
+      await saveResumeVersion(requireFirestore(), "anonymous", {
         input: resumeData,
         output: cleaned,
         score: totalScore
@@ -1454,7 +1459,7 @@ async function startServer() {
       const decodedToken = await admin.auth().verifyIdToken(idToken);
       const uid = decodedToken.uid;
       const encrypted = encrypt(JSON.stringify({ gemini: geminiKey, openai: openaiKey }));
-      await db.collection("users").doc(uid).set({ encryptedApiKey: encrypted }, { merge: true });
+      await requireFirestore().collection("users").doc(uid).set({ encryptedApiKey: encrypted }, { merge: true });
       res.status(200).json({ success: true });
     } catch (error: any) {
       console.error("[Diagnostics] Update Error:", error);

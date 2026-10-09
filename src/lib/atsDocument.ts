@@ -213,7 +213,11 @@ export function sanitizedMetadata(value: string): string {
 
 export function resumeFileName(resume: AtsDocument, role: string, extension: string, company?: string): string {
   const safe = (value: string) => value.replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").replace(/[. ]+$/g, "").trim();
-  return `${[safe(resume.personal_info.name) || "Candidate", safe(role) || "Resume", company ? safe(company) : ""].filter(Boolean).join("-")}.${extension}`;
+  const name = safe(resume.personal_info.name) || "Candidate";
+  const target = safe(role) || "Resume";
+  const parts = extension === "pdf" ? [target, name] : [name, target];
+  if (company) parts.push(safe(company));
+  return `${parts.filter(Boolean).join(extension === "pdf" ? " - " : "-")}.${extension}`;
 }
 
 export function assertUnmaskedExport(masked: boolean, blocks: ExportBlock[]): void {

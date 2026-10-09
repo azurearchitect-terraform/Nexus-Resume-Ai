@@ -1,11 +1,16 @@
-import React, { useEffect } from 'react';
-import { CheckCircle2, AlertCircle, Info } from 'lucide-react';
+import React, { useEffect, useRef } from 'react';
+import { CheckCircle2, AlertCircle, Info, X } from 'lucide-react';
 
 export const Toast = ({ message, type, onClose }: { message: string, type: 'success' | 'error' | 'info', onClose: () => void }) => {
+  const closeRef = useRef(onClose);
   useEffect(() => {
-    const timer = setTimeout(onClose, 3000);
-    return () => clearTimeout(timer);
+    closeRef.current = onClose;
   }, [onClose]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => closeRef.current(), 3000);
+    return () => clearTimeout(timer);
+  }, [message, type]);
 
   const bgColors = {
     success: 'bg-emerald-500',
@@ -14,11 +19,17 @@ export const Toast = ({ message, type, onClose }: { message: string, type: 'succ
   };
 
   return (
-    <div className={`fixed bottom-4 right-4 z-50 flex items-center gap-2 px-4 py-3 rounded-lg shadow-lg text-white ${bgColors[type]}`}>
-      {type === 'success' && <CheckCircle2 className="w-5 h-5" />}
-      {type === 'error' && <AlertCircle className="w-5 h-5" />}
-      {type === 'info' && <Info className="w-5 h-5" />}
-      <span className="text-sm font-medium">{message}</span>
+    <div className={`fixed bottom-4 right-4 left-4 sm:left-auto sm:max-w-lg z-50 flex items-center gap-2 px-4 py-3 rounded-lg shadow-lg text-white ${bgColors[type]}`}>
+      <div role={type === 'error' ? 'alert' : 'status'} className="flex min-w-0 items-center gap-2">
+        {type === 'success' && <CheckCircle2 aria-hidden="true" className="w-5 h-5 shrink-0" />}
+        {type === 'error' && <AlertCircle aria-hidden="true" className="w-5 h-5 shrink-0" />}
+        {type === 'info' && <Info aria-hidden="true" className="w-5 h-5 shrink-0" />}
+        <span className="text-sm font-medium break-words">{message}</span>
+      </div>
+      <button type="button" onClick={onClose} aria-label="Close notification" title="Close notification"
+        className="ml-auto shrink-0 rounded p-1 hover:bg-white/20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white">
+        <X aria-hidden="true" className="w-5 h-5" />
+      </button>
     </div>
   );
 };
