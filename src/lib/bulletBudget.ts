@@ -27,7 +27,7 @@ function bulletStrength(text: string): number {
   const value = text.trim();
   const words = value.split(/\s+/).length;
   let score = 0;
-  if (/^(architected|built|designed|implemented|migrated|automated|reduced|delivered|led|created|launched|secured|optimized|standardized|refactored)\b/i.test(value)) score += 2;
+  if (/^(architected|built|designed|implemented|migrated|automated|reduced|delivered|led|created|launched|secured|optimized|standardized|refactored|governed|configured|consolidated|instrumented|partnered|defined|evaluated|diagnosed|hardened|negotiated|mentored)\b/i.test(value)) score += 2;
   else score -= 1;
   if (/\b(worked on|helped|assisted|responsible for|involved in)\b/i.test(value)) score -= 2;
   if (/\b(improved|reduced|increased|enabled|eliminated|prevented|delivered|launched|retired|resolved)\b/i.test(value)) score += 2;
@@ -1114,11 +1114,13 @@ function isUsableBullet(value: unknown): value is string {
 }
 
 /**
- * The strongest `max` bullets, in their original order. Strength uses action,
- * specificity, outcome and length signals; bullets carrying a figure the source never
- * states are pushed down, bullets backing a STAR story are protected, and a small
- * prior respects the model's own ordering (which the prompts tie to relevance to
- * the posting). Ties go to the earlier bullet.
+ * The strongest `max` bullets, in their original order. Bullets that back a STAR story
+ * are kept first (up to the ceiling, strongest first), because a story whose bullet is
+ * trimmed is discarded. The remaining slots go to the strongest of the rest: strength
+ * uses action, specificity, outcome and length signals; bullets carrying a figure the
+ * source never states are pushed down, and a small prior respects the model's own
+ * ordering (which the prompts tie to relevance to the posting). Ties go to the
+ * earlier bullet.
  */
 export function pickStrongestBullets(
   bullets: string[],
@@ -1139,13 +1141,14 @@ export function pickStrongestBullets(
   const ranked = usable.map((text, idx) => {
     let score = bulletStrength(text);
     if (options.figureIndex && findUnsupportedFigures(text, options.figureIndex).length > 0) score -= 3;
-    if (options.protectedKeys && options.protectedKeys.has(normalizeKey(text))) score += 3;
     if (prefer && findTerms(text, prefer).length > 0) score += 0.5;
     score += total > 1 ? 1 - idx / (total - 1) : 0;
-    return { idx, score };
+    return { idx, score, backsStory: Boolean(options.protectedKeys?.has(normalizeKey(text))) };
   });
   ranked.sort((a, b) => b.score - a.score || a.idx - b.idx);
-  const keep = new Set(ranked.slice(0, limit).map((r) => r.idx));
+  const reserved = ranked.filter((r) => r.backsStory).slice(0, limit);
+  const rest = ranked.filter((r) => !r.backsStory).slice(0, limit - reserved.length);
+  const keep = new Set([...reserved, ...rest].map((r) => r.idx));
   return {
     kept: usable.filter((_, idx) => keep.has(idx)),
     removed: usable.filter((_, idx) => !keep.has(idx)),
