@@ -4,6 +4,8 @@ import {
   TREND_COVERAGE_METHOD,
   type TrendCoverageEntry,
   type TrendCoverageReport,
+  describeTrendSource,
+  trendsFromReport,
 } from '../lib/linkedinTrends';
 
 interface LinkedInTrendsCardProps {
@@ -79,14 +81,41 @@ export const LinkedInTrendsCard: React.FC<LinkedInTrendsCardProps> = ({ report: 
   const asOf = typeof report.as_of === 'string' && report.as_of ? report.as_of : CURATED_TRENDS_REVIEWED;
   const supported = report.used.length + report.available.length;
   const sections = SECTIONS.filter((section) => report[section.key].length > 0);
+  const source = describeTrendSource(trendsFromReport(report)) || `Curated skills for ${label} (reviewed ${asOf})`;
   return (
     <div className={`p-4 rounded-xl border ${isDarkMode ? 'glass-panel border-white/10' : 'glass-panel-light border-black/5'}`}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <h3 className={`text-xs font-bold uppercase tracking-widest ${isDarkMode ? 'text-blue-400' : 'text-blue-700'}`}>LinkedIn Trends</h3>
-          <p className="text-[10px] mt-1 opacity-70 truncate" title={`Curated LinkedIn trends for ${label} (reviewed ${asOf})`}>
-            Curated LinkedIn trends for {label} (reviewed {asOf})
+          <h3 className={`text-xs font-bold uppercase tracking-widest ${isDarkMode ? 'text-blue-400' : 'text-blue-700'}`}>Job Market Trends</h3>
+          <p className="text-[10px] mt-1 opacity-70" title={source}>
+            {source}
           </p>
+          {report.market && (
+            <p className="text-[10px] mt-1 opacity-70">
+              {report.market.remote_postings} postings mention remote work.
+              {report.market.previous_sample_at
+                ? ` Demand changes compare with ${report.market.previous_sample_at}.`
+                : ' First or non-comparable sample: no growth trend claimed.'}
+              {' '}{report.market.warnings.join(' ')}
+            </p>
+          )}
+          {report.market && (
+            <details className="text-[10px] mt-2">
+              <summary className="cursor-pointer">Sampled skill demand (not resume coverage)</summary>
+              <table className="mt-1 w-full text-left">
+                <thead><tr><th>Skill</th><th>Postings</th><th>Sample share</th><th>Change</th></tr></thead>
+                <tbody>
+                  {report.market.demand.filter(d => d.postings > 0).map(d => (
+                    <tr key={d.name}>
+                      <td>{d.name}</td><td>{d.postings}</td><td>{d.share}%</td>
+                      <td>{d.change === null ? 'No baseline' : `${d.change > 0 ? '+' : ''}${d.change} pp`}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <p className="opacity-60 mt-1">pp = percentage-point change in sampled posting share, not total market growth.</p>
+            </details>
+          )}
           <p className="text-[10px] mt-0.5 opacity-50">
             Only trending skills your own material supports are used &middot; gaps are never added for you
           </p>

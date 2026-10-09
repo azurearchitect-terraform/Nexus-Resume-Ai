@@ -112,6 +112,9 @@ import CorporateProgressLoader from './components/CorporateProgressLoader';
 import { AuthModal } from './components/AuthModal';
 import { TermsModal } from './components/TermsModal';
 import { describeMatchScore } from './lib/matchScore';
+import { selectMasterSource, type MasterComparison } from './lib/masterSelection';
+import { fetchJobMarketTrends } from './lib/trendClient';
+import type { LinkedInTrends } from './lib/linkedinTrends';
 import { describeImpactScore } from './lib/impactScore';
 import { defaultBulletRules, normalizeBulletRules, type BulletRules } from './lib/bulletBudget';
 import { bulletRulesSummary } from './lib/bulletRulesPreview';
@@ -428,6 +431,8 @@ export default function App() {
       const saved = localStorage.getItem('selectedResumeId');
       return saved || 'default';
   });
+  const [masterComparison, setMasterComparison] = useState<MasterComparison[]>([]);
+  const [marketTrendStatus, setMarketTrendStatus] = useState('');
 
   const handleSetActiveResume = (id: string) => {
     setMasterResumes(prev => prev.map(r => ({ ...r, isActive: r.id === id })));
@@ -2500,6 +2505,48 @@ export default function App() {
         optimizationJobDescription = await fetchJobDescription(jobUrl, getRouterConfig());
         setJobDescription(optimizationJobDescription);
       }
+      if (!overrideResumeText) {
+        setOptimizationStatus("Comparing master resumes against the job description...");
+        const decision = selectMasterSource(
+          masterResumes, optimizationJobDescription, selectedResumeId, resumeText,
+          { targetRole, companyName }
+        );
+        setMasterComparison(decision.comparison);
+        const best = decision.best;
+        if (best) {
+          finalResumeText = best.text;
+          if (decision.syncEditor) {
+            setSelectedResumeId(best.id);
+            localStorage.setItem('selectedResumeId', best.id);
+            setResumeText(best.text);
+            setMasterResumes(prev => prev.map(r => ({ ...r, isActive: r.id === best.id })));
+            showToast(`Selected ${best.name}: ${best.analysis.score}% JD match`, "success");
+          } else if (!best.fromEditor) {
+            // Switching the editor would discard the user's unsaved changes to another resume.
+            showToast(`Using ${best.name} (${best.analysis.score}% JD match) for this run. Your unsaved editor changes were kept.`, "info");
+          }
+        }
+      } else {
+        setMasterComparison([]);
+      }
+      let jobMarketTrends: LinkedInTrends | null = null;
+      if (followLinkedInTrends) {
+        setOptimizationStatus("Loading daily job-market demand...");
+        try {
+          jobMarketTrends = await fetchJobMarketTrends(
+            targetRole, optimizationJobDescription, await auth.currentUser?.getIdToken()
+          );
+          const m = jobMarketTrends.market!;
+          setMarketTrendStatus(`Adzuna: ${m.sample_size} postings across ${m.countries.join(', ')}; refreshed ${m.refreshed_at}${m.stale ? ' (STALE)' : ''}. ${m.warnings.join(' ')}`);
+          if (m.stale) showToast("Job-market data is stale; the last successful snapshot will be used.", "info");
+        } catch (e) {
+          const message = e instanceof Error ? e.message : "Job-market trends are unavailable.";
+          setMarketTrendStatus(`Unavailable: ${message} This optimization will use the JD only, without market trends.`);
+          showToast(`${message} Continuing without market trends.`, "info");
+        }
+      } else {
+        setMarketTrendStatus('');
+      }
       const finalTargetRole = targetRole || "Professional Candidate";
       let finalMode = mode;
       try {
@@ -2558,7 +2605,7 @@ export default function App() {
           targetCompany,
           brainDump,
           {
-            bulletRules, linkedinTrends: followLinkedInTrends,
+            bulletRules, linkedinTrends: Boolean(jobMarketTrends), jobMarketTrends,
             audienceBrief: audienceBrief(
               optimizationAudienceDecision?.fingerprint === jdFingerprint(optimizationJobDescription, targetRole) ? optimizationAudienceDecision : null,
               audienceId
@@ -4321,10 +4368,10 @@ export default function App() {
 
                           <div className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl border text-[11px] ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-gray-50 border-black/5'}`}>
                             <span className="min-w-0">
-                              <span className="block text-[10px] font-bold uppercase tracking-widest">LinkedIn Trends</span>
+                              <span className="block text-[10px] font-bold uppercase tracking-widest">Job Market Trends</span>
                               <span className={isDarkMode ? 'opacity-60' : 'opacity-70'}>
                                 {trendPreview
-                                  ? `Curated for ${trendPreview.label} (reviewed ${trendPreview.as_of}); unsupported skills are never added.`
+                                  ? marketTrendStatus || `Adzuna demand for ${trendPreview.label}: India and supported APAC markets, including remote-posting searches. Loaded on Optimize; unsupported skills are never added.`
                                   : 'Off - trending skills are not considered.'}
                               </span>
                             </span>
@@ -4332,7 +4379,7 @@ export default function App() {
                               type="button"
                               role="switch"
                               aria-checked={followLinkedInTrends}
-                              aria-label="Follow LinkedIn trends"
+                              aria-label="Use daily job-market trends"
                               onClick={() => setFollowLinkedInTrends((enabled) => !enabled)}
                               className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
                                 followLinkedInTrends ? 'bg-emerald-500' : isDarkMode ? 'bg-white/15' : 'bg-black/15'
@@ -4341,6 +4388,18 @@ export default function App() {
                               <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transition-transform ${followLinkedInTrends ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
                             </button>
                           </div>
+
+                          {masterComparison.length > 0 && (
+                            <div className={`px-3 py-2 rounded-xl border text-[11px] ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-gray-50 border-black/5'}`}>
+                              <p className="font-bold">Last optimization source: {masterComparison[0].name} ({masterComparison[0].analysis.score}% JD match)</p>
+                              <p className="opacity-60">Computed before rewriting; ties retain the current master. Current editor changes are included.</p>
+                              <div className="mt-1 flex flex-wrap gap-2">
+                                {masterComparison.map(r => (
+                                  <span key={r.id} title={describeMatchScore(r.analysis)}>{r.name}: {r.analysis.score}%</span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
 
                           <div className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl border text-[11px] ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-gray-50 border-black/5'}`}>
                             <span className="min-w-0 truncate" title={bulletRulesSummary(bulletRules).join(' · ')}>

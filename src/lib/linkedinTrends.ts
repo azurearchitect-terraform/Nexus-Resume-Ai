@@ -1,21 +1,11 @@
 /**
- * LinkedIn trend alignment.
- *
- * "Follow the LinkedIn trend" means using the skills that are trending on
- * LinkedIn for the target role - but only where the candidate's own material
- * supports them. Trending skills without evidence are reported as gaps and are
- * never written into the resume.
- *
- * The trend list comes from a curated catalogue per role family, reviewed
- * against LinkedIn's published skill trends (CURATED_TRENDS_REVIEWED). There is
- * deliberately no live refresh: LinkedIn has no public trends API, and the
- * Gemini API terms for Grounding with Google Search forbid caching, sharing or
- * modifying grounded results, so a search-grounded list cannot steer generation.
- * To refresh the trends, edit the catalogue below and bump the review month.
- *
- * Everything in this module is pure and shared by the browser and the server.
+ * Shared skill vocabulary, evidence-safe guidance, and coverage reports.
+ * Active optimization uses daily Adzuna demand snapshots from the server.
+ * The curated catalogue supplies role families and recognized skill names;
+ * it is not a live source. Legacy LinkedIn field names remain for saved reports.
  */
 import { buildTermPattern, detectJdPlatforms, findTerms } from "./bulletBudget";
+import { MARKET_TREND_METHOD, readMarketMetadata, type MarketTrendMetadata } from "./jobMarketTrends";
 
 export const TREND_METHOD = "linkedin-trends-v1";
 export const TREND_COVERAGE_METHOD = "linkedin-trend-coverage-v1";
@@ -53,6 +43,7 @@ export interface LinkedInTrends {
   /** "YYYY-MM": the month the curated catalogue was reviewed. */
   as_of: string;
   skills: TrendSkill[];
+  market?: MarketTrendMetadata;
 }
 
 /**
@@ -92,6 +83,7 @@ export interface TrendCoverageReport {
   removed: string[];
   /** used / (used + available) as a whole percentage; null when nothing is evidenced. */
   coverage: number | null;
+  market?: MarketTrendMetadata;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1062,14 +1054,17 @@ export function normalizeLinkedInTrends(raw: unknown): LinkedInTrends | null {
   if (!skills.length) return null;
   const families = unique((Array.isArray(record.families) ? record.families : []).map(sanitizeKey).filter(Boolean)).slice(0, 3);
   const roleFamily = sanitizeKey(record.role_family) || families[0] || "general";
+  const market = readMarketMetadata(record.market);
+  if (record.method === MARKET_TREND_METHOD && !market) return null;
   return {
-    method: TREND_METHOD,
+    method: market ? MARKET_TREND_METHOD : TREND_METHOD,
     role_family: roleFamily,
     families: families.length ? families : [roleFamily],
     label: cleanLine(record.label, 120) || FAMILY_BY_ID.get(roleFamily)?.label || "Target role",
     target_role: cleanLine(record.target_role, 160),
     as_of: sanitizeTrendDate(record.as_of) || CURATED_TRENDS_REVIEWED,
     skills,
+    ...(market ? { market } : {}),
   };
 }
 
@@ -1337,6 +1332,7 @@ export function computeTrendCoverage(
     label: trends.label,
     target_role: trends.target_role,
     as_of: trends.as_of,
+    ...(trends.market ? { market: trends.market } : {}),
     entries,
     used,
     available,
@@ -1404,13 +1400,17 @@ const PREFER_TERMS_MAX = 80;
 /** One line naming where the trend list came from, for prompts and the report UI. */
 export function describeTrendSource(trends: LinkedInTrends | null | undefined): string {
   if (!trends) return "";
-  return `Curated LinkedIn trends for ${trends.label || "the target role"} (reviewed ${trends.as_of || CURATED_TRENDS_REVIEWED})`;
+  if (trends.market) {
+    const m = trends.market;
+    return `Adzuna job-market demand for ${trends.label}; ${m.sample_size} sampled posting snippets across ${m.countries.join(", ")}; refreshed ${m.refreshed_at}${m.stale ? " (STALE)" : ""}`;
+  }
+  return `Curated skill catalogue for ${trends.label || "the target role"} (labelled ${trends.as_of || CURATED_TRENDS_REVIEWED}; not live data)`;
 }
 
 /** Stable text that changes whenever the trend list does (for cache keys). */
 export function trendFingerprint(trends: LinkedInTrends | null | undefined): string {
   if (!trends || !trends.skills.length) return "none";
-  return [trends.as_of, trends.families.join("+"), trends.skills.map((skill) => trendNameKey(skill.name)).join("|")].join(":");
+  return [trends.market?.refreshed_at || trends.as_of, trends.families.join("+"), trends.skills.map((skill) => trendNameKey(skill.name)).join("|")].join(":");
 }
 
 export interface TrendBriefOptions {
@@ -1439,11 +1439,11 @@ export function buildTrendBrief(trends: LinkedInTrends | null | undefined, optio
     const listed = skills.filter((_, i) => !evidence[i].length && secondary[i].length > 0).slice(0, BRIEF_ROLE_MAX);
     if (!own.length && !listed.length) {
       return [
-        `LINKEDIN TRENDING SKILLS (${label}):`,
+        `JOB-MARKET SKILLS (${label}):`,
         "- This role's source shows none of the trending skills. Do not name any trending skill, tool or platform the source does not show.",
       ].join("\n");
     }
-    const lines = [`LINKEDIN TRENDING SKILLS (${label}) - recruiters search for these exact names:`];
+    const lines = [`JOB-MARKET SKILLS (${label}) - use these evidenced names:`];
     if (own.length) {
       lines.push(`- Shown in this role's source - use the exact name when a bullet covers that work: ${own.map((skill) => skill.name).join(", ")}.`);
     }
@@ -1460,16 +1460,16 @@ export function buildTrendBrief(trends: LinkedInTrends | null | undefined, optio
     .map((skill, i) => ({ skill, terms: evidence[i] }))
     .filter((item) => item.terms.length > 0)
     .slice(0, BRIEF_DOCUMENT_MAX);
-  const header = `LINKEDIN TREND ALIGNMENT (${describeTrendSource(trends)}):`;
+  const header = `JOB-MARKET SKILL ALIGNMENT (${describeTrendSource(trends)}):`;
   if (!supported.length) {
     return [
       header,
-      "- None of the skills trending on LinkedIn for this role appear in the candidate's material. Do not add them; the candidate sees them as gaps to close.",
+      "- None of the listed market skills appear in the candidate's material. Do not add them; the candidate sees them as gaps to close.",
     ].join("\n");
   }
   const lines = [
     header,
-    "Recruiters on LinkedIn search for these skills for this kind of role. The candidate's material supports each one - use the exact trending name:",
+    "The candidate's material supports these market skills - use their exact names:",
     ...supported.map(({ skill, terms }) => {
       const shown = terms.filter((term) => trendNameKey(term) !== trendNameKey(skill.name)).slice(0, 3);
       return `- ${skill.name}${shown.length ? ` (source shows: ${shown.join(", ")})` : ""}`;

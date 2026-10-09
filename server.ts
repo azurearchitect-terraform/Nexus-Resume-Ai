@@ -29,13 +29,14 @@ import {
   planBulletBudgets,
 } from "./src/lib/bulletBudget";
 import {
-  activeLinkedInTrends,
   applyTrendCoverage,
   buildTrendBrief,
   trendEvidenceText,
   trendFingerprint,
   trendPreferTerms,
+  type LinkedInTrends,
 } from "./src/lib/linkedinTrends";
+import { JobMarketTrendService } from "./server/jobMarketTrends";
 // import { scrapeJobs } from "./server/jobScraper";
 
 dotenv.config();
@@ -235,6 +236,47 @@ async function startServer() {
   app.use(cors());
   app.use(bodyParser.json({ limit: '50mb' }));
   app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
+  let marketTrends: JobMarketTrendService | null = null;
+  let marketTrendsError = "";
+  try {
+    marketTrends = new JobMarketTrendService({
+      appId: process.env.ADZUNA_APP_ID || "",
+      appKey: process.env.ADZUNA_APP_KEY || "",
+      countries: (process.env.ADZUNA_COUNTRIES || "in,au,nz,sg").split(",").map(c => c.trim()).filter(Boolean),
+      cacheFile: process.env.ADZUNA_CACHE_FILE || path.join(process.cwd(), ".cache", "job-market-trends.json"),
+    });
+  } catch (e) {
+    // An optional feature's bad setting must not stop resume optimization from starting.
+    marketTrendsError = `Job Market Trends is misconfigured: ${e instanceof Error ? e.message : "invalid settings"}`;
+    console.error("[JobMarketTrends]", marketTrendsError);
+  }
+  const getMarketTrends = (role: string, jobDescription?: string): Promise<LinkedInTrends> =>
+    marketTrends ? marketTrends.get(role, jobDescription) : Promise.reject(new Error(marketTrendsError));
+  if (marketTrends && process.env.ADZUNA_APP_ID && process.env.ADZUNA_APP_KEY) {
+    const service = marketTrends;
+    void service.refreshKnown();
+    const refreshTimer = setInterval(() => { void service.refreshKnown(); }, 60 * 60 * 1000);
+    refreshTimer.unref();
+  }
+  app.post("/api/job-market-trends", async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer /, "");
+    if (!token) return res.status(401).json({ error: "Sign in to retrieve job-market trends." });
+    try {
+      await admin.auth().verifyIdToken(token);
+    } catch {
+      return res.status(401).json({ error: "Your session is invalid. Sign in again." });
+    }
+    const { targetRole, jobDescription } = req.body;
+    if (typeof targetRole !== "string" || !targetRole.trim() || targetRole.length > 160 ||
+        (jobDescription !== undefined && (typeof jobDescription !== "string" || jobDescription.length > 50000))) {
+      return res.status(400).json({ error: "Provide a target role (up to 160 characters) and a valid job description." });
+    }
+    try {
+      return res.json(await getMarketTrends(targetRole, jobDescription));
+    } catch (e) {
+      return res.status(503).json({ error: e instanceof Error ? e.message : "Job-market trends are unavailable." });
+    }
+  });
 
   // Debug: Log all incoming requests
   app.use((req, res, next) => {
@@ -779,9 +821,23 @@ async function startServer() {
     }
 
     const bulletRules = activeBulletRules(requestedBulletRules);
-    const trends = activeLinkedInTrends(linkedinTrends, targetRole, jobDescription);
-
+    if (linkedinTrends === true) {
+      try {
+        await admin.auth().verifyIdToken(idToken);
+      } catch {
+        return res.status(401).json({ error: "Sign in again to use job-market trends." });
+      }
+    }
+    let trends: LinkedInTrends | null = null;
     try {
+      if (linkedinTrends === true) {
+        try {
+          trends = await getMarketTrends(targetRole, jobDescription);
+        } catch (e) {
+          // The client already showed why trends were unavailable; optimizing without them beats failing.
+          console.warn("[Pipeline] Continuing without job-market trends:", e instanceof Error ? e.message : e);
+        }
+      }
       // 1. Fetch keys securely from Firestore
       const keys = await getApiKeys(idToken);
       let geminiKey = keys?.gemini || "";

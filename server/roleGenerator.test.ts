@@ -339,7 +339,7 @@ test("generatePerRole hands every role its planned budget, the rules, the trends
   for (const prompt of Object.values(prompts)) {
     assert.ok(prompt.includes("POSTING BODY") && prompt.includes("Priority JD keywords: Terraform"));
     assert.ok(prompt.includes("THE CANDIDATE'S BULLET RULES"));
-    assert.ok(prompt.includes("LINKEDIN TRENDING SKILLS"));
+    assert.ok(prompt.includes("JOB-MARKET SKILLS"));
     assert.ok(prompt.includes("Set by the bullet planner: ") && prompt.includes("bullet rule - one of the 2 most recent roles"));
     assert.ok(prompt.includes("TERMINOLOGY BAN"));
   }
@@ -357,7 +357,7 @@ test("generatePerRole without a plan, rules or trends still reads each role's ow
   });
   assert.equal(results.length, 1);
   assert.ok(prompts[0].includes("HARD LIMIT: 2 to 3 bullets"));
-  assert.ok(!prompts[0].includes("THE CANDIDATE'S BULLET RULES") && !prompts[0].includes("LINKEDIN TRENDING SKILLS"));
+  assert.ok(!prompts[0].includes("THE CANDIDATE'S BULLET RULES") && !prompts[0].includes("JOB-MARKET SKILLS"));
 });
 
 test("the Bullet Rules trimmer keeps the bullet that backs a STAR story", () => {

@@ -11,13 +11,13 @@ import { computeMatchScore, MatchScoreOptions, MatchScoreResult } from "../lib/m
 import { activeBulletRules, enforceBulletBudgets, planBulletBudgets, rolesFromResumeText } from "../lib/bulletBudget";
 import type { BulletBudgetReport, BulletRules } from "../lib/bulletBudget";
 import {
-  activeLinkedInTrends,
   applyTrendCoverage,
   buildTrendBrief,
   trendEvidenceText,
   trendPreferTerms,
 } from "../lib/linkedinTrends";
 import type { LinkedInTrends, TrendCoverageReport } from "../lib/linkedinTrends";
+import { fetchJobMarketTrends } from "../lib/trendClient";
 import {
   buildAudiencePrompt, extractJdSignals, fuseAudienceDecision, jdFingerprint,
   scoreAudiencesByRules, type AudienceDecision,
@@ -105,6 +105,8 @@ export interface EngineConfig {
 export interface OptimizeResumeOptions {
   bulletRules?: BulletRules | null;
   linkedinTrends?: boolean;
+  /** One server-verified snapshot shared across audiences; null explicitly disables trends. */
+  jobMarketTrends?: LinkedInTrends | null;
   audienceBrief?: string;
   /** Hiring company, so the match score does not count its own name as a skill. */
   companyName?: string;
@@ -666,7 +668,19 @@ export async function optimizeResume(
 ): Promise<OptimizationResult> {
   const routedConfig = routeTask(recruiterSimulationMode ? 'recruiter_simulation' : 'rewrite_resume', config);
   const bulletRules = activeBulletRules(options.bulletRules);
-  const trends = activeLinkedInTrends(options.linkedinTrends, targetRole, jobDescription);
+  let trends: LinkedInTrends | null = null;
+  if (options.linkedinTrends) {
+    if (options.jobMarketTrends !== undefined) {
+      trends = options.jobMarketTrends;
+    } else {
+      try {
+        trends = await fetchJobMarketTrends(targetRole, jobDescription, await auth.currentUser?.getIdToken());
+      } catch (e) {
+        // Trend guidance is optional: an unavailable snapshot must never stop the optimization.
+        console.warn("[Nexus AI] Optimizing without job-market trends:", e instanceof Error ? e.message : e);
+      }
+    }
+  }
   const { companyName } = options;
   const analysisOptions: AnalysisOptions = { targetRole, companyName, brainDump, linkedInPdfText };
   // "Generic Tech" in the picker falls back to the hiring company, so a posting at Amazon
