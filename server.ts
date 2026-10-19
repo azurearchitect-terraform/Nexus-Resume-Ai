@@ -246,8 +246,8 @@ async function startServer() {
   let marketTrendsError = "";
   try {
     marketTrends = new JobMarketTrendService({
-      appId: process.env.ADZUNA_APP_ID || "",
-      appKey: process.env.ADZUNA_APP_KEY || "",
+      appId: (process.env.ADZUNA_APP_ID || "").trim(),
+      appKey: (process.env.ADZUNA_APP_KEY || "").trim(),
       countries: (process.env.ADZUNA_COUNTRIES || "in,au,nz,sg").split(",").map(c => c.trim()).filter(Boolean),
       cacheFile: process.env.ADZUNA_CACHE_FILE || path.join(process.cwd(), ".cache", "job-market-trends.json"),
     });

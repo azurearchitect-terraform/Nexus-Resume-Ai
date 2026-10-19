@@ -68,7 +68,13 @@ export class JobMarketTrendService {
     private request: typeof fetch = fetch,
     private clock: () => number = Date.now
   ) {
-    if (!config.countries.length || config.countries.some(c => !COUNTRIES.has(c))) {
+    this.config = {
+      ...config,
+      appId: (config.appId || "").trim(),
+      appKey: (config.appKey || "").trim(),
+      countries: config.countries.map(c => c.trim()),
+    };
+    if (!this.config.countries.length || this.config.countries.some(c => !COUNTRIES.has(c))) {
       throw new Error("ADZUNA_COUNTRIES must use supported APAC codes: in, au, nz, sg.");
     }
     this.load();
@@ -116,7 +122,7 @@ export class JobMarketTrendService {
     url.search = new URLSearchParams({
       app_id: this.config.appId, app_key: this.config.appKey,
       ...(remote ? { what_and: `${query} remote` } : { what: query }),
-      results_per_page: "50", sort_by: "date", sort_dir: "down", max_days_old: "30",
+      results_per_page: "50", sort_by: "date", max_days_old: "30",
       "content-type": "application/json",
     }).toString();
     let response: Response;

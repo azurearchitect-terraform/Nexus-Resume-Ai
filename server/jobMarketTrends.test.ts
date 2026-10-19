@@ -48,7 +48,7 @@ test("snapshot is deduplicated, cached for 24h, and refreshed by scheduled check
       assert.equal(url.hostname, "api.adzuna.com");
       assert.equal(url.searchParams.get("max_days_old"), "30");
       assert.equal(url.searchParams.get("results_per_page"), "50");
-      assert.equal(url.searchParams.get("sort_dir"), "down");
+      assert.equal(url.searchParams.get("sort_by"), "date");
       if (url.searchParams.has("what_and")) assert.ok(url.searchParams.get("what_and")?.endsWith(" remote"));
       return ads();
     };
