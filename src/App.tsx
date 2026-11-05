@@ -83,6 +83,19 @@ import Markdown from 'react-markdown';
 import { RouterConfig } from './services/aiRouter';
 import { extractTextFromPDFFile } from './lib/pdfUtils';
 import { saveAs } from 'file-saver';
+
+// ============================================================================
+// AI Manager Types
+// ============================================================================
+export interface AiModel {
+  id: string;
+  name: string;
+  provider: string;
+  model: string;
+  apiKey: string;
+  isActive?: boolean;
+  createdAt: number;
+}
 const LinkedInImporter = lazy(() => import('./components/LinkedInImporter').then(m => ({ default: m.LinkedInImporter })));
 const ResumeJsonModal = lazy(() => import('./components/ResumeJsonModal').then(m => ({ default: m.ResumeJsonModal })));
 const CareerQuiz = lazy(() => import('./components/CareerQuiz').then(m => ({ default: m.CareerQuiz })));
@@ -269,6 +282,12 @@ export default function App() {
   const [isSavingProfile, setIsSavingProfile] = useState(false);
   const [isApiKeySaved, setIsApiKeySaved] = useState(false);
   const [encryptedApiKey, setEncryptedApiKey] = useState('');
+  const [aiModels, setAiModels] = useState<AiModel[]>([]);
+  const [activeAiModelId, setActiveAiModelId] = useState<string | null>(null);
+  const [isManagingAi, setIsManagingAi] = useState(false);
+  const [newAiModel, setNewAiModel] = useState({ name: '', provider: '', model: '', apiKey: '' });
+  const [editingAiModelId, setEditingAiModelId] = useState<string | null>(null);
+  const [isSavingAiModels, setIsSavingAiModels] = useState(false);
   const [isTestingDrive, setIsTestingDrive] = useState(false);
   const [driveFiles, setDriveFiles] = useState<any[]>([]);
   const [isFetchingDriveFiles, setIsFetchingDriveFiles] = useState(false);
@@ -680,6 +699,18 @@ export default function App() {
                 console.error("Failed to decrypt keys on load:", decryptErr);
               }
             }
+
+            // Load AI Manager models from Firestore
+            if (data.aiModels && Array.isArray(data.aiModels)) {
+              setAiModels(data.aiModels);
+              // Set active model if none selected yet
+              if (!activeAiModelId) {
+                const active = data.aiModels.find((m: AiModel) => m.isActive);
+                if (active) setActiveAiModelId(active.id);
+                else if (data.aiModels.length > 0) setActiveAiModelId(data.aiModels[0].id);
+              }
+            }
+
             if (data.driveAccessToken) {
               setDriveAccessToken(data.driveAccessToken);
               setIsDriveConnected(true);
@@ -967,6 +998,7 @@ export default function App() {
       const dataToSync: any = {
         userId: user.uid,
         masterResumes: masterResumes, // Sync array of resumes
+        aiModels,
         customPrompt: customPrompt || "",
         bulletRules,
         followLinkedInTrends,
@@ -1008,7 +1040,7 @@ export default function App() {
     }, 2000); // Sync 2 seconds after last change
 
     return () => clearTimeout(timeoutId);
-  }, [hasUnsavedChanges, user, resumeText, customPrompt, bulletRules, followLinkedInTrends, trendSource, linkedInTrendImport, isDriveConnected, versioningEnabled, isAutosaveEnabled, selectedDriveFolder, driveAccessToken, masterResumes]);
+  }, [hasUnsavedChanges, user, resumeText, customPrompt, bulletRules, followLinkedInTrends, trendSource, linkedInTrendImport, isDriveConnected, versioningEnabled, isAutosaveEnabled, selectedDriveFolder, driveAccessToken, masterResumes, aiModels]);
 
   useEffect(() => {
     const handleBeforeUnload = () => {
@@ -1028,6 +1060,103 @@ export default function App() {
     } catch (err) {
       console.error("Logout Error:", err);
     }
+  };
+
+  // ============================================================================
+  // AI Manager - CRUD for AI models synced to Firestore
+  // ============================================================================
+
+  const saveAiModelsToFirestore = async (models: AiModel[]) => {
+    if (!user) return;
+    setIsSavingAiModels(true);
+    try {
+      const currentUser = auth.currentUser || user;
+      const idToken = currentUser ? await currentUser.getIdToken() : "";
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (idToken) headers['Authorization'] = `Bearer ${idToken}`;
+      const response = await fetch('/api/ai-models', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ aiModels: models })
+      });
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || "Failed to save AI models");
+      }
+      setIsSavingAiModels(false);
+      showToast("AI models saved to cloud", "success");
+    } catch (err: any) {
+      setIsSavingAiModels(false);
+      console.error("Error saving AI models:", err);
+      showToast(err.message || "Failed to save AI models to cloud", "error");
+    }
+  };
+
+  const deleteAiModelFromFirestore = async (id: string) => {
+    if (!user) return;
+    try {
+      const currentUser = auth.currentUser || user;
+      const idToken = currentUser ? await currentUser.getIdToken() : "";
+      const headers: Record<string, string> = {};
+      if (idToken) headers['Authorization'] = `Bearer ${idToken}`;
+      const response = await fetch(`/api/ai-models/${id}`, {
+        method: 'DELETE',
+        headers
+      });
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || "Failed to delete AI model");
+      }
+      setAiModels(prev => prev.filter(m => m.id !== id));
+      if (activeAiModelId === id) {
+        setActiveAiModelId(null);
+      }
+      showToast("AI model deleted", "success");
+    } catch (err: any) {
+      console.error("Error deleting AI model:", err);
+      showToast(err.message || "Failed to delete AI model", "error");
+    }
+  };
+
+  const addAiModel = () => {
+    if (!newAiModel.name || !newAiModel.provider || !newAiModel.model || !newAiModel.apiKey) {
+      showToast("Please fill in all fields", "error");
+      return;
+    }
+    const model: AiModel = {
+      id: `ai_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      name: newAiModel.name,
+      provider: newAiModel.provider,
+      model: newAiModel.model,
+      apiKey: newAiModel.apiKey,
+      isActive: aiModels.length === 0,
+      createdAt: Date.now()
+    };
+    const updated = [...aiModels, model];
+    setAiModels(updated);
+    setNewAiModel({ name: '', provider: '', model: '', apiKey: '' });
+    setEditingAiModelId(null);
+    if (model.isActive) setActiveAiModelId(model.id);
+    showToast(`AI model "${model.name}" added`, "success");
+    // Auto-save to Firestore
+    if (user) void saveAiModelsToFirestore(updated);
+  };
+
+  const updateAiModel = (id: string, updates: Partial<AiModel>) => {
+    setAiModels(prev => prev.map(m => m.id === id ? { ...m, ...updates } : m));
+    if (updates.isActive) {
+      setAiModels(prev => prev.map(m => m.id === id ? { ...m, isActive: true } : { ...m, isActive: m.id === id }));
+      setActiveAiModelId(id);
+    }
+    setEditingAiModelId(null);
+    showToast("AI model updated", "success");
+    if (user) void saveAiModelsToFirestore(aiModels.map(m => m.id === id ? { ...m, ...updates } : m));
+  };
+
+  const toggleActiveAiModel = (id: string) => {
+    setAiModels(prev => prev.map(m => ({ ...m, isActive: m.id === id })));
+    setActiveAiModelId(id);
+    if (user) void saveAiModelsToFirestore(aiModels.map(m => ({ ...m, isActive: m.id === id })));
   };
 
   const handleSaveProfile = async () => {
@@ -1071,6 +1200,7 @@ export default function App() {
       await setDoc(doc(db, 'users', user.uid), {
         userId: user.uid,
         encryptedApiKey: finalEncryptedKey,
+        aiModels,
         masterResumes: masterResumes,
         customPrompt: customPrompt,
         bulletRules,
@@ -2252,17 +2382,20 @@ export default function App() {
   };
 
   const getRouterConfig = (): RouterConfig => {
+    // If an AI Manager model is active, use its config to override the engine
+    const activeAiModel = aiModels.find(m => m.id === activeAiModelId);
+    
     return {
       mode: selectedEngine as any,
       geminiConfig: {
         engine: 'gemini',
-        model: engineConfig.gemini.model,
-        apiKey: geminiApiKey || (typeof encryptedApiKey === 'string' && encryptedApiKey.includes(':') ? encryptedApiKey : '') || engineConfig.gemini.apiKey
+        model: activeAiModel?.provider === 'gemini' ? activeAiModel.model : engineConfig.gemini.model,
+        apiKey: activeAiModel?.provider === 'gemini' ? activeAiModel.apiKey : (geminiApiKey || (typeof encryptedApiKey === 'string' && encryptedApiKey.includes(':') ? encryptedApiKey : '') || engineConfig.gemini.apiKey)
       },
       openaiConfig: {
         engine: 'openai',
-        model: engineConfig.openai.model,
-        apiKey: openaiApiKey || (typeof encryptedApiKey === 'string' && encryptedApiKey.includes(':') ? encryptedApiKey : '') || engineConfig.openai.apiKey
+        model: activeAiModel?.provider === 'openai' ? activeAiModel.model : engineConfig.openai.model,
+        apiKey: activeAiModel?.provider === 'openai' ? activeAiModel.apiKey : (openaiApiKey || (typeof encryptedApiKey === 'string' && encryptedApiKey.includes(':') ? encryptedApiKey : '') || engineConfig.openai.apiKey)
       }
     };
   };
@@ -2817,8 +2950,10 @@ export default function App() {
         const errorMessage = err.message || 'Failed to optimize resume. Please try again.';
         if (errorMessage.includes('DECRYPTION_FAILED')) {
           setError('Your session or encryption key has changed. Please go to the Profile tab and re-save your API keys.');
+          showToast('Your session or encryption key has changed. Please go to the Profile tab and re-save your API keys.', 'error');
         } else {
           setError(errorMessage);
+          showToast(errorMessage, 'error');
         }
       }
     } finally {
@@ -3262,11 +3397,13 @@ export default function App() {
     setSuitabilityResult(null);
     setOptimizationProgress(0);
     setSelectedAudiences(['microsoft']);
-    
+    setPrintScale(1);
+    setZoom(1);
+
     // Clear the backend cache
     fetch('/api/cache/clear', { method: 'POST' }).catch(err => console.error("Failed to clear backend cache", err));
     
-    showToast("Job details and cache cleared.", "info");
+    showToast("Job details, layout scale, and cache cleared.", "info");
   };
 
   const renderSimplifiedResume = () => {
@@ -4259,6 +4396,50 @@ export default function App() {
                                     <p className="text-[10px] opacity-70 leading-relaxed font-medium">Smart routing enabled: Using Gemini for analysis and OpenAI for tone optimization.</p>
                                   </div>
                                 )}
+                                
+                                {/* AI Manager Models - Custom models synced to cloud */}
+                                {aiModels.length > 0 && (
+                                  <div className="mt-4 space-y-2">
+                                    <label className="block text-[9px] font-black uppercase tracking-widest mb-2 opacity-50">AI Manager Models (Cloud Synced)</label>
+                                    <div className="space-y-2">
+                                      {aiModels.map((model) => (
+                                        <div
+                                          key={model.id}
+                                          onClick={() => setActiveAiModelId(model.id)}
+                                          className={`flex items-center justify-between p-2.5 rounded-lg border cursor-pointer transition-all ${
+                                            activeAiModelId === model.id
+                                              ? (isDarkMode ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300' : 'bg-emerald-50 border-emerald-200 text-emerald-700')
+                                              : (isDarkMode ? 'bg-white/5 border-white/10 text-white/60 hover:border-white/20 hover:bg-white/10' : 'bg-white border-black/5 text-black/70 hover:border-black/10 hover:bg-black/5')
+                                          }`}
+                                        >
+                                          <div className="flex items-center gap-2 flex-1 min-w-0">
+                                            <div className={`w-2 h-2 rounded-full ${activeAiModelId === model.id ? 'bg-emerald-500' : 'bg-gray-500'}`} />
+                                            <div>
+                                              <div className="text-xs font-bold truncate">{model.name}</div>
+                                              <div className="text-[9px] opacity-60 truncate">{model.provider.toUpperCase()} • {model.model} {activeAiModelId === model.id && ' (ACTIVE)'}</div>
+                                            </div>
+                                          </div>
+                                          <button
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              toggleActiveAiModel(model.id);
+                                            }}
+                                            className={`p-1.5 rounded-lg transition-colors text-[9px] font-bold ${
+                                              activeAiModelId === model.id
+                                                ? 'bg-emerald-500 text-black'
+                                                : 'bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20'
+                                            }`}
+                                          >
+                                            {activeAiModelId === model.id ? 'Default' : 'Set Default'}
+                                          </button>
+                                        </div>
+                                      ))}
+                                    </div>
+                                    {activeAiModelId && (
+                                      <p className="text-[9px] mt-2 opacity-60 italic">Active model will be used for all optimizations. Change in AI Manager or here.</p>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             </div>
                           </div>
@@ -4953,30 +5134,175 @@ export default function App() {
                           </label>
                         </div>
 
-                        <button
-                          onClick={() => {
-                            setConfirmDialog({
-                              message: "Are you sure you want to clear your saved API keys?",
-                              onConfirm: async () => {
-                                if (!user) return;
-                                setConfirmDialog(null);
-                                setOpenaiApiKey('');
-                                setEncryptedApiKey('');
-                                setIsApiKeySaved(false);
-                                // Also update Firestore
-                                await setDoc(doc(db, 'users', user.uid), {
-                                  userId: user.uid,
-                                  encryptedApiKey: ''
-                                }, { merge: true });
-                                showToast("API keys cleared.", "success");
-                              },
-                              onCancel: () => setConfirmDialog(null)
-                            });
-                          }}
-                          className="w-full py-3 rounded-xl font-bold transition-all flex items-center justify-center gap-2 bg-red-500 hover:bg-red-600 text-white shadow-lg shadow-red-500/20"
-                        >
-                          Clear Saved API Keys
-                        </button>
+                        {/* ========================================================
+                           AI MANAGER SECTION
+                           ======================================================== */}
+                        <div className="mt-8 pt-8 border-t border-white/10">
+                          <div className="flex items-center justify-between mb-4">
+                            <label className="block text-[10px] font-bold uppercase tracking-widest mb-2 opacity-50 flex items-center gap-2">
+                              <Cpu className="w-3 h-3" />
+                              AI Model Manager
+                            </label>
+                            {user && (
+                              <button
+                                onClick={() => setIsManagingAi(!isManagingAi)}
+                                className={`text-[9px] font-bold uppercase tracking-widest transition-colors ${isManagingAi ? 'text-emerald-400' : 'text-emerald-500/60 hover:text-emerald-400'}`}
+                              >
+                                {isManagingAi ? 'Hide Manager' : 'Manage AI Models'}
+                              </button>
+                            )}
+                          </div>
+
+                          {isManagingAi && (
+                            <div className="space-y-3">
+                              {/* Add New AI Model Form */}
+                              <div className="p-3 rounded-xl border border-dashed border-emerald-500/30 bg-emerald-500/5">
+                                <label className="block text-[9px] font-bold uppercase tracking-widest mb-2 opacity-60">Add New AI Model</label>
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+                                  <input
+                                    type="text"
+                                    placeholder="Display Name (e.g. Gemini 3.6 Flash)"
+                                    value={newAiModel.name}
+                                    onChange={(e) => setNewAiModel({ ...newAiModel, name: e.target.value })}
+                                    className={`w-full px-3 py-2 text-xs border rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500/20 transition-all ${
+                                      isDarkMode ? 'bg-black text-white border-white/10' : 'bg-white text-black border-black/10'
+                                    }`}
+                                  />
+                                  <input
+                                    type="text"
+                                    placeholder="Provider (e.g. gemini, openai, anthropic)"
+                                    value={newAiModel.provider}
+                                    onChange={(e) => setNewAiModel({ ...newAiModel, provider: e.target.value })}
+                                    className={`w-full px-3 py-2 text-xs border rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500/20 transition-all ${
+                                      isDarkMode ? 'bg-black text-white border-white/10' : 'bg-white text-black border-black/10'
+                                    }`}
+                                  />
+                                  <input
+                                    type="text"
+                                    placeholder="Model ID (e.g. gemini-3.6-flash)"
+                                    value={newAiModel.model}
+                                    onChange={(e) => setNewAiModel({ ...newAiModel, model: e.target.value })}
+                                    className={`w-full px-3 py-2 text-xs border rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500/20 transition-all ${
+                                      isDarkMode ? 'bg-black text-white border-white/10' : 'bg-white text-black border-black/10'
+                                    }`}
+                                  />
+                                  <input
+                                    type="password"
+                                    placeholder="API Key"
+                                    value={newAiModel.apiKey}
+                                    onChange={(e) => setNewAiModel({ ...newAiModel, apiKey: e.target.value })}
+                                    className={`w-full px-3 py-2 text-xs border rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500/20 transition-all ${
+                                      isDarkMode ? 'bg-black text-white border-white/10' : 'bg-white text-black border-black/10'
+                                    }`}
+                                  />
+                                </div>
+                                <button
+                                  onClick={addAiModel}
+                                  disabled={isSavingAiModels || !newAiModel.name || !newAiModel.provider || !newAiModel.model || !newAiModel.apiKey}
+                                  className={`w-full py-2 rounded-xl font-bold text-[9px] uppercase tracking-widest transition-all ${
+                                    isSavingAiModels || !newAiModel.name || !newAiModel.provider || !newAiModel.model || !newAiModel.apiKey
+                                      ? 'bg-gray-400 text-white cursor-not-allowed'
+                                      : 'bg-emerald-500 hover:bg-emerald-600 text-white shadow-sm shadow-emerald-500/20'
+                                  }`}
+                                >
+                                  {isSavingAiModels ? 'Saving...' : 'Add Model'}
+                                </button>
+                              </div>
+
+                              {/* AI Models List */}
+                              {aiModels.length > 0 ? (
+                                <div className="space-y-2">
+                                  <label className="block text-[9px] font-bold uppercase tracking-widest mb-2 opacity-60">Your AI Models (synced to cloud)</label>
+                                  {aiModels.map((model) => (
+                                    <div key={model.id} className="flex items-center justify-between p-2.5 rounded-xl border bg-white/5 dark:bg-black/5 border-white/10 dark:border-white/5">
+                                      <div className="flex items-center gap-3 flex-1 min-w-0">
+                                        <div className={`w-2 h-2 rounded-full ${model.isActive ? 'bg-emerald-500' : 'bg-gray-500'}`} />
+                                        <div>
+                                          <div className="text-xs font-bold truncate">{model.name}</div>
+                                          <div className="text-[9px] opacity-50 truncate">{model.provider} • {model.model}</div>
+                                        </div>
+                                        {model.isActive && (
+                                          <span className="text-[9px] bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20">Default</span>
+                                        )}
+                                      </div>
+                                      <div className="flex items-center gap-1.5 ml-2">
+                                        <button
+                                          onClick={() => toggleActiveAiModel(model.id)}
+                                          className={`p-1.5 rounded-lg transition-colors ${
+                                            model.isActive
+                                              ? 'bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30'
+                                              : 'bg-white/5 text-white/40 hover:bg-white/10 dark:bg-black/5 dark:text-white/60 dark:hover:bg-black/10'
+                                          }`}
+                                          title={model.isActive ? 'Set as Default' : 'Set as Default'}
+                                        >
+                                          <Check className={`w-2.5 h-2.5 ${model.isActive ? 'fill-current' : ''}`} />
+                                        </button>
+                                        <button
+                                          onClick={() => setEditingAiModelId(model.id)}
+                                          className="p-1.5 rounded-lg hover:bg-white/10 dark:hover:bg-black/10 transition-colors"
+                                          title="Edit"
+                                        >
+                                          <Edit2 className="w-3 h-3 opacity-60" />
+                                        </button>
+                                        <button
+                                          onClick={() => deleteAiModelFromFirestore(model.id)}
+                                          className="p-1.5 rounded-lg hover:bg-red-500/10 text-red-500 transition-colors"
+                                          title="Delete"
+                                        >
+                                          <Trash2 className="w-3 h-3" />
+                                        </button>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : (
+                                <div className="text-center py-4 opacity-50">
+                                  <p className="text-[9px]">No AI models configured yet. Add your first model above.</p>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Edit Inline Form (simplified - just toggle active for now) */}
+                          {editingAiModelId && (
+                            <div className="p-3 rounded-xl border border-emerald-500/30 bg-emerald-500/5 mt-3">
+                              <label className="block text-[9px] font-bold uppercase tracking-widest mb-2 opacity-60">Editing Model</label>
+                              <p className="text-xs mb-3">Use the "Set as Default" button above to switch models. Edit name/provider/model by re-adding the model.</p>
+                              <button
+                                onClick={() => setEditingAiModelId(null)}
+                                className="w-full py-2 rounded-xl text-[9px] font-bold text-red-500 hover:text-red-400 transition-colors"
+                              >
+                                Cancel Edit
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                        {/* ======================================================== */}
+
+                      <button
+                        onClick={() => {
+                          setConfirmDialog({
+                            message: "Are you sure you want to clear your saved API keys?",
+                            onConfirm: async () => {
+                              if (!user) return;
+                              setConfirmDialog(null);
+                              setOpenaiApiKey('');
+                              setEncryptedApiKey('');
+                              setIsApiKeySaved(false);
+                              // Also update Firestore
+                              await setDoc(doc(db, 'users', user.uid), {
+                                userId: user.uid,
+                                encryptedApiKey: ''
+                              }, { merge: true });
+                              showToast("API keys cleared.", "success");
+                            },
+                            onCancel: () => setConfirmDialog(null)
+                          });
+                        }}
+                        className="w-full py-3 rounded-xl font-bold transition-all flex items-center justify-center gap-2 bg-red-500 hover:bg-red-600 text-white shadow-lg shadow-red-500/20"
+                      >
+                        Clear Saved API Keys
+                      </button>
                       </div>
                     ) : (
                       <div className="text-center py-8 opacity-60">

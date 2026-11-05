@@ -305,7 +305,7 @@ async function startServer() {
       });
       try {
         const page = await browser.newPage();
-        await page.setContent(html, { waitUntil: 'networkidle0' });
+        await page.setContent(html, { waitUntil: 'load' });
         await page.evaluateHandle('document.fonts.ready');
         const pdf = await page.pdf({ format: 'A4', printBackground: true });
         res.contentType("application/pdf");
@@ -1410,6 +1410,85 @@ async function startServer() {
     }
   });
 
+  // ============================================================================
+  // AI Model Management Endpoints - Sync AI models to Firestore for universal access
+  // ============================================================================
+
+  // GET /api/ai-models - List user's AI models from Firestore
+  app.get("/api/ai-models", async (req, res) => {
+    const authHeader = req.header('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: "Sign in to manage AI models." });
+    }
+    const idToken = authHeader.split('Bearer ')[1];
+    try {
+      const decodedToken = await admin.auth().verifyIdToken(idToken);
+      const uid = decodedToken.uid;
+      const doc = await requireFirestore().collection("users").doc(uid).get();
+      if (!doc.exists) {
+        return res.json({ aiModels: [] });
+      }
+      const data = doc.data();
+      return res.json({ aiModels: data?.aiModels || [] });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message || "Failed to fetch AI models" });
+    }
+  });
+
+  // POST /api/ai-models - Save/replace user's AI models array in Firestore
+  app.post("/api/ai-models", async (req, res) => {
+    const authHeader = req.header('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: "Sign in to manage AI models." });
+    }
+    const idToken = authHeader.split('Bearer ')[1];
+    const { aiModels } = req.body;
+    if (!Array.isArray(aiModels)) {
+      return res.status(400).json({ error: "aiModels array is required" });
+    }
+    try {
+      const decodedToken = await admin.auth().verifyIdToken(idToken);
+      const uid = decodedToken.uid;
+      await requireFirestore().collection("users").doc(uid).set({
+        userId: uid,
+        aiModels,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+      return res.json({ success: true, aiModels });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message || "Failed to save AI models" });
+    }
+  });
+
+  // DELETE /api/ai-models/:id - Remove a specific AI model from user's list
+  app.delete("/api/ai-models/:id", async (req, res) => {
+    const authHeader = req.header('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: "Sign in to manage AI models." });
+    }
+    const idToken = authHeader.split('Bearer ')[1];
+    const { id } = req.params;
+    try {
+      const decodedToken = await admin.auth().verifyIdToken(idToken);
+      const uid = decodedToken.uid;
+      const docRef = requireFirestore().collection("users").doc(uid);
+      const docSnap = await docRef.get();
+      if (!docSnap.exists) {
+        return res.status(404).json({ error: "User profile not found" });
+      }
+      const data = docSnap.data();
+      const aiModels = (data?.aiModels || []).filter((m: any) => m.id !== id);
+      await docRef.set({
+        userId: uid,
+        aiModels,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+      return res.json({ success: true, aiModels });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message || "Failed to delete AI model" });
+    }
+  });
+
   app.post("/api/diagnose/gemini", async (req, res) => {
     const { idToken } = req.body;
     try {
@@ -1786,7 +1865,7 @@ async function startServer() {
 
       // Set content and wait for it to load
       await page.setContent(baseHtml, { 
-        waitUntil: "networkidle0", 
+        waitUntil: "load", 
         timeout: 30000 
       });
 
