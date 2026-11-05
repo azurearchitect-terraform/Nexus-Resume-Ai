@@ -1893,9 +1893,9 @@ async function startServer() {
           .filter(size => Number.isFinite(size) && size > 0);
         return sizes.length ? Math.min(...sizes) : 11;
       });
-      // Keep the complete content on additional pages rather than forcing sub-10 pt text.
-      // A small cushion accounts for Chrome's fractional font-size quantization.
-      const MIN_SCALE = Math.min(1, Math.max(0.5, 10.05 / smallestTextPt));
+      // Allow shrinking to keep content on exactly 2 pages. Floor is ~8.5pt effective
+      // text (still legible) and scale 0.4 (40% of full size) as an absolute bottom.
+      const MIN_SCALE = Math.min(1, Math.max(0.4, 8.5 / smallestTextPt));
 
       const renderAt = (s: number) => page.pdf({
         format: "A4",
@@ -1923,7 +1923,7 @@ async function startServer() {
               paddingTop: parseFloat(style.paddingTop), paddingBottom: parseFloat(style.paddingBottom),
             };
           }));
-        for (const factor of [0.94, 0.88]) {
+        for (const factor of [0.94, 0.88, 0.82, 0.76]) {
           density = factor;
           await page.evaluate(({ spacing, factor }) => {
             const elements = document.querySelectorAll<HTMLElement>("#resume-container *");
@@ -1956,8 +1956,8 @@ async function startServer() {
         // Seed the search with the frontend's estimate so we converge faster.
         const hint = Number(scale);
         const probes: number[] = [];
-        if (Number.isFinite(hint) && hint > lo && hint < hi) probes.push(hint);
-        for (let i = probes.length; i < 5; i++) probes.push(NaN);
+        if (Number.isFinite(hint) && hint > lo && hint <= hi) probes.push(hint);
+        for (let i = probes.length; i < 10; i++) probes.push(NaN);
 
         for (const seeded of probes) {
           const mid = Number.isFinite(seeded) ? seeded : (lo + hi) / 2;
@@ -1972,11 +1972,11 @@ async function startServer() {
           }
         }
 
-        // If the readable floor still overflows, preserve the extra pages and all content.
-        if (best) pdfBuffer = best;
-        else {
-          finalScale = MIN_SCALE;
-          pdfBuffer = await renderAt(MIN_SCALE);
+        // If the readable floor still overflows, go below MIN_SCALE as a last resort
+        // to keep everything on exactly 2 pages.
+        if (!best) {
+          finalScale = Math.max(0.35, MIN_SCALE * 0.85);
+          pdfBuffer = await renderAt(finalScale);
         }
         pageCount = countPdfPages(pdfBuffer);
       }
